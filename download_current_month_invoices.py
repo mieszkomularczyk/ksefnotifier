@@ -31,14 +31,17 @@ from zoneinfo import ZoneInfo
 
 
 DEFAULT_BASE_URL = "https://api.ksef.mf.gov.pl/v2"
+AUTH_CONTEXT_TYPE = "Nip"
 DEFAULT_SUBJECT_TYPE = "Subject2"
 DEFAULT_DATE_TYPE = "PermanentStorage"
 DEFAULT_PAGE_SIZE = 100
-DEFAULT_CONTEXT_TYPE = "Nip"
 DEFAULT_AUTH_POLL_INTERVAL = 1.0
 DEFAULT_AUTH_TIMEOUT_SECONDS = 120
-DEFAULT_FILENAME_MODE = "id"
+DEFAULT_FILENAME_MODE = "seller-id"
 DEFAULT_RENDER_MODE = "yes"
+DEFAULT_TIMEZONE = "Europe/Warsaw"
+DEFAULT_LOCAL_OUT_DIR = "downloads"
+DEFAULT_TOKEN_FILE = "token.txt"
 SELLER_NAME_MAX_LEN = 15
 TRACKING_FILE_NAME = "downloaded.txt"
 MASTER_PREFIX_FILE = "dir_prefix.txt"
@@ -156,65 +159,49 @@ class KsefClient:
         return payload.decode("utf-8", errors="replace")
 
 
+def get_app_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def resolve_app_relative_path(path_text: str) -> Path:
+    path = Path(path_text).expanduser()
+    if path.is_absolute():
+        return path
+    return get_app_dir() / path
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Authenticate with KSeF token and download current-month invoices."
+        description=(
+            "Download purchase invoices from KSeF for the selected month and "
+            "optionally render each downloaded XML into PDF.\n\n"
+            "Files next to this script or EXE:\n"
+            "  token.txt      KSeF token used for authentication by default.\n"
+            "  dir_prefix.txt Optional master path. If present and non-empty, invoices are "
+            "saved only to <dir_prefix>/<YYYY_MM>/ksef.\n\n"
+            "Target path behavior:\n"
+            "  If dir_prefix.txt exists and contains a path, that location is used as the "
+            "only download/render target.\n"
+            "  If dir_prefix.txt is missing or empty, files are saved only to "
+            "./downloads/<YYYY-MM> next to this script or EXE.\n\n"
+            "The script authenticates using the NIP embedded in the token, downloads only "
+            "purchase invoices (Subject2), and stores downloaded invoice IDs in "
+            "downloaded.txt inside the active target folder."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--token-file",
-        default="token.txt",
-        help="Path to KSeF token file (default: token.txt).",
-    )
-    parser.add_argument(
-        "--context-type",
-        default=DEFAULT_CONTEXT_TYPE,
-        choices=["Nip", "InternalId", "NipVatUe", "PeppolId"],
-        help="Context identifier type for /auth/ksef-token.",
-    )
-    parser.add_argument(
-        "--context-value",
-        default=None,
-        help="Context identifier value. If omitted and context-type=Nip, tries to infer from token.",
-    )
-    parser.add_argument(
-        "--auth-poll-interval",
-        type=float,
-        default=DEFAULT_AUTH_POLL_INTERVAL,
-        help=f"Polling interval in seconds for auth status (default: {DEFAULT_AUTH_POLL_INTERVAL}).",
-    )
-    parser.add_argument(
-        "--auth-timeout-seconds",
-        type=int,
-        default=DEFAULT_AUTH_TIMEOUT_SECONDS,
-        help=f"Maximum wait for auth completion (default: {DEFAULT_AUTH_TIMEOUT_SECONDS}).",
-    )
-    parser.add_argument(
-        "--subject-type",
-        default=DEFAULT_SUBJECT_TYPE,
-        choices=["Subject2"],
-        help="Fixed to Subject2: purchase invoices (you as buyer).",
+        default=DEFAULT_TOKEN_FILE,
+        help="Path to KSeF token file (default: token.txt next to the script or EXE).",
     )
     parser.add_argument(
         "--date-type",
         default=DEFAULT_DATE_TYPE,
         choices=["Issue", "Invoicing", "PermanentStorage"],
         help="Date dimension used in query filters.",
-    )
-    parser.add_argument(
-        "--page-size",
-        type=int,
-        default=DEFAULT_PAGE_SIZE,
-        help="Metadata page size (10-250, default 100).",
-    )
-    parser.add_argument(
-        "--out-dir",
-        default="downloads",
-        help="Directory where invoice XML files will be saved.",
-    )
-    parser.add_argument(
-        "--timezone",
-        default="Europe/Warsaw",
-        help="Timezone used to compute the current month window (default: Europe/Warsaw).",
     )
     parser.add_argument(
         "--year",
@@ -274,7 +261,7 @@ def load_ksef_token(token_file_path: Path) -> tuple[str, str]:
 
 
 def load_master_prefix() -> Optional[Path]:
-    prefix_file = Path(MASTER_PREFIX_FILE)
+    prefix_file = get_app_dir() / MASTER_PREFIX_FILE
     if not prefix_file.exists():
         return None
 
@@ -291,7 +278,7 @@ def load_master_prefix() -> Optional[Path]:
 
     path = Path(raw).expanduser()
     if not path.is_absolute():
-        path = (Path.cwd() / path).resolve()
+        path = (get_app_dir() / path).resolve()
     return path
 
 
@@ -321,21 +308,12 @@ def infer_nip_from_token(ksef_token: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
-def resolve_context_value(
-    context_type: str,
-    provided_value: Optional[str],
-    ksef_token: str,
-) -> str:
-    if provided_value:
-        return provided_value.strip()
-
-    if context_type == "Nip":
-        inferred_nip = infer_nip_from_token(ksef_token)
-        if inferred_nip:
-            return inferred_nip
-
+def resolve_context_nip(ksef_token: str) -> str:
+    inferred_nip = infer_nip_from_token(ksef_token)
+    if inferred_nip:
+        return inferred_nip
     raise KsefApiError(
-        "Missing context value. Provide --context-value (or KSEF token with embedded 'nip-XXXXXXXXXX')."
+        "Missing NIP in token. The token must include an embedded 'nip-XXXXXXXXXX' segment."
     )
 
 
@@ -480,14 +458,11 @@ def authenticate_by_ksef_token(
     client: KsefClient,
     *,
     ksef_token: str,
-    context_type: str,
     context_value: str,
-    poll_interval_seconds: float,
-    timeout_seconds: int,
 ) -> AuthResult:
-    if poll_interval_seconds <= 0:
+    if DEFAULT_AUTH_POLL_INTERVAL <= 0:
         raise ValueError("auth-poll-interval must be > 0")
-    if timeout_seconds <= 0:
+    if DEFAULT_AUTH_TIMEOUT_SECONDS <= 0:
         raise ValueError("auth-timeout-seconds must be > 0")
 
     challenge_response = client.post_json("/auth/challenge")
@@ -510,7 +485,7 @@ def authenticate_by_ksef_token(
         json_body={
             "challenge": challenge,
             "contextIdentifier": {
-                "type": context_type,
+                "type": AUTH_CONTEXT_TYPE,
                 "value": context_value,
             },
             "encryptedToken": encrypted_token,
@@ -526,7 +501,7 @@ def authenticate_by_ksef_token(
     if not isinstance(auth_token, str) or not auth_token:
         raise KsefApiError("Invalid /auth/ksef-token response: missing authenticationToken.token")
 
-    deadline = time.monotonic() + timeout_seconds
+    deadline = time.monotonic() + DEFAULT_AUTH_TIMEOUT_SECONDS
 
     while True:
         status_response = client.get_json(
@@ -542,9 +517,9 @@ def authenticate_by_ksef_token(
         if code == 100:
             if time.monotonic() >= deadline:
                 raise KsefApiError(
-                    f"Authentication timed out after {timeout_seconds}s (reference {reference_number})."
+                    f"Authentication timed out after {DEFAULT_AUTH_TIMEOUT_SECONDS}s (reference {reference_number})."
                 )
-            time.sleep(poll_interval_seconds)
+            time.sleep(DEFAULT_AUTH_POLL_INTERVAL)
             continue
 
         description = status.get("description") if isinstance(status, dict) else None
@@ -578,13 +553,11 @@ def authenticate_by_ksef_token(
 def fetch_all_metadata(
     client: KsefClient,
     *,
-    subject_type: str,
     date_type: str,
     date_from: datetime,
     date_to: datetime,
-    page_size: int,
 ) -> List[Dict[str, Any]]:
-    if page_size < 10 or page_size > 250:
+    if DEFAULT_PAGE_SIZE < 10 or DEFAULT_PAGE_SIZE > 250:
         raise ValueError("page_size must be between 10 and 250")
 
     page_offset = 0
@@ -592,7 +565,7 @@ def fetch_all_metadata(
 
     while True:
         filters = {
-            "subjectType": subject_type,
+            "subjectType": DEFAULT_SUBJECT_TYPE,
             "dateRange": {
                 "dateType": date_type,
                 "from": to_iso8601(date_from),
@@ -605,7 +578,7 @@ def fetch_all_metadata(
             query={
                 "sortOrder": "Asc",
                 "pageOffset": page_offset,
-                "pageSize": page_size,
+                "pageSize": DEFAULT_PAGE_SIZE,
             },
             json_body=filters,
         )
@@ -750,30 +723,30 @@ def render_downloaded_xmls(xml_paths: Iterable[Path]) -> tuple[int, int]:
 def main() -> int:
     args = parse_args()
 
-    token_file_path = Path(args.token_file)
+    token_file_path = resolve_app_relative_path(args.token_file)
     try:
         ksef_token, token_source = load_ksef_token(token_file_path)
-        context_value = resolve_context_value(args.context_type, args.context_value, ksef_token)
+        context_value = resolve_context_nip(ksef_token)
     except (KsefApiError, OSError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
     try:
         start, end = month_range_for_selection(
-            args.timezone,
+            DEFAULT_TIMEZONE,
             year=args.year,
             month=args.month,
         )
     except Exception as exc:
-        print(f"Invalid timezone '{args.timezone}': {exc}", file=sys.stderr)
+        print(f"Invalid timezone '{DEFAULT_TIMEZONE}': {exc}", file=sys.stderr)
         return 2
 
     unauth_client = KsefClient(base_url=DEFAULT_BASE_URL)
 
     print(f"KSeF base URL: {DEFAULT_BASE_URL}")
     print(f"Token source: {token_source}")
-    print(f"Auth context: {args.context_type}={context_value}")
-    print(f"Subject type: {args.subject_type}")
+    print(f"Auth context: {AUTH_CONTEXT_TYPE}={context_value}")
+    print(f"Subject type: {DEFAULT_SUBJECT_TYPE}")
     print(f"Date type: {args.date_type}")
     print(f"Current month window: {to_iso8601(start)} -> {to_iso8601(end)}")
 
@@ -781,10 +754,7 @@ def main() -> int:
         auth_result = authenticate_by_ksef_token(
             unauth_client,
             ksef_token=ksef_token,
-            context_type=args.context_type,
             context_value=context_value,
-            poll_interval_seconds=args.auth_poll_interval,
-            timeout_seconds=args.auth_timeout_seconds,
         )
     except (KsefApiError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
@@ -797,11 +767,9 @@ def main() -> int:
     try:
         metadata = fetch_all_metadata(
             invoice_client,
-            subject_type=args.subject_type,
             date_type=args.date_type,
             date_from=start,
             date_to=end,
-            page_size=args.page_size,
         )
     except (KsefApiError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
@@ -818,36 +786,30 @@ def main() -> int:
         filename_mode=args.filename_mode,
     )
 
-    month_dir_local = f"{start.year:04d}-{start.month:02d}"
     month_dir_master = f"{start.year:04d}_{start.month:02d}"
-    output_dir = Path(args.out_dir) / month_dir_local
+    month_dir_local = f"{start.year:04d}-{start.month:02d}"
 
     master_prefix = load_master_prefix()
-    mirror_dir: Optional[Path] = None
     if master_prefix is not None:
-        mirror_dir = master_prefix / month_dir_master / "ksef"
+        output_dir = master_prefix / month_dir_master / "ksef"
+        output_source = f"{(get_app_dir() / MASTER_PREFIX_FILE).resolve()} -> {output_dir.resolve()}"
+    else:
+        output_dir = get_app_dir() / DEFAULT_LOCAL_OUT_DIR / month_dir_local
+        output_source = f"default local path -> {output_dir.resolve()}"
 
-    output_dirs = [output_dir]
-    if mirror_dir is not None:
-        output_dirs.append(mirror_dir)
-
-    # If mirror is configured, treat mirror tracking file as authoritative source.
-    tracking_file_primary = (mirror_dir / TRACKING_FILE_NAME) if mirror_dir is not None else (output_dir / TRACKING_FILE_NAME)
-    tracking_files_to_write = [directory / TRACKING_FILE_NAME for directory in output_dirs]
-    tracked_ids = load_tracking_ids(tracking_file_primary)
+    tracking_file = output_dir / TRACKING_FILE_NAME
+    tracked_ids = load_tracking_ids(tracking_file)
     already_tracked = sum(1 for invoice_id, _ in download_targets if invoice_id in tracked_ids)
 
-    if tracking_file_primary.exists():
-        print(f"Tracking file source: {tracking_file_primary.resolve()}")
+    if tracking_file.exists():
+        print(f"Tracking file source: {tracking_file.resolve()}")
     else:
-        print(f"Tracking file source: {tracking_file_primary.resolve()} (missing -> full redownload of untracked IDs)")
+        print(f"Tracking file source: {tracking_file.resolve()} (missing -> full redownload of untracked IDs)")
 
     print(f"Tracked invoice IDs: {len(tracked_ids)}")
     print(f"Already tracked in this run: {already_tracked}")
-    if mirror_dir is not None:
-        print(f"Mirror output directory: {mirror_dir.resolve()}")
-    else:
-        print(f"Mirror output directory: not configured ({MASTER_PREFIX_FILE} missing/empty)")
+    print(f"Target path source: {output_source}")
+    print(f"Output directory: {output_dir.resolve()}")
 
     if args.dry_run:
         return 0
@@ -856,7 +818,7 @@ def main() -> int:
         downloaded, skipped, downloaded_xml_paths = download_invoices(
             invoice_client,
             download_targets,
-            output_dirs,
+            [output_dir],
             tracked_ids,
             overwrite=args.overwrite,
         )
@@ -864,12 +826,10 @@ def main() -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
-    for track_file in tracking_files_to_write:
-        write_tracking_ids(track_file, tracked_ids)
+    write_tracking_ids(tracking_file, tracked_ids)
 
     print(f"Downloaded XML files: {downloaded}")
     print(f"Skipped existing files: {skipped}")
-    print(f"Output directory: {output_dir.resolve()}")
 
     if args.render == "yes":
         if downloaded_xml_paths:
