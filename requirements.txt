@@ -1,3 +1,7 @@
-cryptography>=46.0.0
-fpdf2>=2.8.0
-qrcode>=7.4.0
+# Runtime dependencies
+cryptography>=46.0.5
+fpdf2>=2.8.7
+qrcode>=8.2
+
+# Build dependency for the standalone Windows executable
+pyinstaller>=6.19.0

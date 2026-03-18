@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 downloads/
+build/
+dist/
+*.spec
 
 token.txt
 dir_prefix.txt
