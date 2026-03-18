@@ -172,6 +172,77 @@ def resolve_app_relative_path(path_text: str) -> Path:
     return get_app_dir() / path
 
 
+def enable_ansi_colors() -> bool:
+    if os.getenv("NO_COLOR"):
+        return False
+
+    if os.name != "nt":
+        return sys.stdout.isatty()
+
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)
+        if handle in (0, -1):
+            return False
+
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)) == 0:
+            return False
+
+        enable_virtual_terminal_processing = 0x0004
+        if mode.value & enable_virtual_terminal_processing:
+            return sys.stdout.isatty()
+
+        if kernel32.SetConsoleMode(handle, mode.value | enable_virtual_terminal_processing) == 0:
+            return False
+
+        return sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+COLOR_ENABLED = enable_ansi_colors()
+
+
+def colorize(text: str, *codes: str) -> str:
+    if not COLOR_ENABLED or not codes:
+        return text
+    return f"\033[{';'.join(codes)}m{text}\033[0m"
+
+
+def console_section(title: str) -> None:
+    print(colorize(f"\n== {title} ==", "1", "36"))
+
+
+def console_info(message: str) -> None:
+    print(f"{colorize('[INFO]', '36')} {message}")
+
+
+def console_ok(message: str) -> None:
+    print(f"{colorize('[ OK ]', '32')} {message}")
+
+
+def console_warn(message: str) -> None:
+    print(f"{colorize('[WARN]', '33')} {message}")
+
+
+def console_error(message: str) -> None:
+    print(f"{colorize('[ERR ]', '31')} {message}", file=sys.stderr)
+
+
+def console_list(title: str, items: Iterable[str], *, empty_message: str) -> None:
+    values = list(items)
+    if not values:
+        console_info(f"{title}: {empty_message}")
+        return
+
+    console_ok(f"{title} ({len(values)}):")
+    for value in values:
+        print(f"  - {colorize(value, '32')}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -691,14 +762,14 @@ def download_invoices(
     return downloaded, skipped_existing, downloaded_xml_paths
 
 
-def render_downloaded_xmls(xml_paths: Iterable[Path]) -> tuple[int, int]:
+def render_downloaded_xmls(xml_paths: Iterable[Path]) -> tuple[List[Path], List[str]]:
     try:
         from render_ksef_invoice_pdf import parse_invoice, render_invoice_pdf
     except Exception as exc:
         raise KsefApiError(f"Failed to import renderer module: {exc}") from exc
 
-    rendered = 0
-    failed = 0
+    rendered_paths: List[Path] = []
+    failures: List[str] = []
 
     unique_xml_paths = sorted(set(xml_paths), key=lambda p: str(p))
     for xml_path in unique_xml_paths:
@@ -712,23 +783,24 @@ def render_downloaded_xmls(xml_paths: Iterable[Path]) -> tuple[int, int]:
                 bold_font=None,
                 hide_empty_fields=False,
             )
-            rendered += 1
+            rendered_paths.append(pdf_path)
         except Exception as exc:
-            failed += 1
-            print(f"Render failed for {xml_path}: {exc}", file=sys.stderr)
+            failures.append(f"{xml_path.name}: {exc}")
 
-    return rendered, failed
+    return rendered_paths, failures
 
 
 def main() -> int:
     args = parse_args()
+    app_dir = get_app_dir()
 
     token_file_path = resolve_app_relative_path(args.token_file)
+    dir_prefix_file = app_dir / MASTER_PREFIX_FILE
     try:
         ksef_token, token_source = load_ksef_token(token_file_path)
         context_value = resolve_context_nip(ksef_token)
     except (KsefApiError, OSError) as exc:
-        print(str(exc), file=sys.stderr)
+        console_error(str(exc))
         return 1
 
     try:
@@ -738,18 +810,61 @@ def main() -> int:
             month=args.month,
         )
     except Exception as exc:
-        print(f"Invalid timezone '{DEFAULT_TIMEZONE}': {exc}", file=sys.stderr)
+        console_error(f"Invalid timezone '{DEFAULT_TIMEZONE}': {exc}")
         return 2
+
+    month_dir_master = f"{start.year:04d}_{start.month:02d}"
+    month_dir_local = f"{start.year:04d}-{start.month:02d}"
+
+    master_prefix = load_master_prefix()
+    if master_prefix is not None:
+        output_dir = master_prefix / month_dir_master / "ksef"
+        dir_prefix_message = (
+            f"{MASTER_PREFIX_FILE} found: {dir_prefix_file.resolve()} -> {output_dir.resolve()}"
+        )
+    else:
+        output_dir = app_dir / DEFAULT_LOCAL_OUT_DIR / month_dir_local
+        if dir_prefix_file.exists():
+            dir_prefix_message = (
+                f"{MASTER_PREFIX_FILE} found but empty: {dir_prefix_file.resolve()}. "
+                f"Using local target directory {output_dir.resolve()}"
+            )
+        else:
+            dir_prefix_message = (
+                f"{MASTER_PREFIX_FILE} not found next to the script or EXE. "
+                f"Using local target directory {output_dir.resolve()}"
+            )
+
+    console_section("Configuration")
+    if token_file_path.exists():
+        console_ok(f"Token file found ({token_file_path.name}): {token_file_path.resolve()}")
+    else:
+        console_warn(f"Token file not found. Using token from {token_source}.")
+    if master_prefix is not None:
+        console_ok(dir_prefix_message)
+    elif dir_prefix_file.exists():
+        console_warn(dir_prefix_message)
+    else:
+        console_info(dir_prefix_message)
+    console_info(f"Target directory: {output_dir.resolve()}")
+    console_info(f"Date range: {to_iso8601(start)} -> {to_iso8601(end)}")
+    console_info(f"Date type: {args.date_type}")
+    console_info(f"Filename mode: {args.filename_mode}")
+    console_info(f"Subject type: {DEFAULT_SUBJECT_TYPE}")
+    console_info(f"Auth context: {AUTH_CONTEXT_TYPE}={context_value}")
+    console_info(f"KSeF base URL: {DEFAULT_BASE_URL}")
+
+    tracking_file = output_dir / TRACKING_FILE_NAME
+    if tracking_file.exists():
+        console_info(f"Tracking file found: {tracking_file.resolve()}")
+    else:
+        console_warn(
+            f"Tracking file missing: {tracking_file.resolve()} -> all untracked invoices will be downloaded"
+        )
 
     unauth_client = KsefClient(base_url=DEFAULT_BASE_URL)
 
-    print(f"KSeF base URL: {DEFAULT_BASE_URL}")
-    print(f"Token source: {token_source}")
-    print(f"Auth context: {AUTH_CONTEXT_TYPE}={context_value}")
-    print(f"Subject type: {DEFAULT_SUBJECT_TYPE}")
-    print(f"Date type: {args.date_type}")
-    print(f"Current month window: {to_iso8601(start)} -> {to_iso8601(end)}")
-
+    console_section("Authentication")
     try:
         auth_result = authenticate_by_ksef_token(
             unauth_client,
@@ -757,13 +872,13 @@ def main() -> int:
             context_value=context_value,
         )
     except (KsefApiError, ValueError) as exc:
-        print(str(exc), file=sys.stderr)
+        console_error(str(exc))
         return 1
-
-    print(f"Authentication succeeded. Reference: {auth_result.reference_number}")
+    console_ok(f"Authentication succeeded. Reference: {auth_result.reference_number}")
 
     invoice_client = KsefClient(base_url=DEFAULT_BASE_URL, bearer_token=auth_result.access_token)
 
+    console_section("Query")
     try:
         metadata = fetch_all_metadata(
             invoice_client,
@@ -772,46 +887,27 @@ def main() -> int:
             date_to=end,
         )
     except (KsefApiError, ValueError) as exc:
-        print(str(exc), file=sys.stderr)
+        console_error(str(exc))
         return 1
 
-    print(f"Metadata rows fetched: {len(metadata)}")
-
     ksef_numbers = unique_ksef_numbers(metadata)
-    print(f"Unique KSeF invoice numbers: {len(ksef_numbers)}")
-    print(f"Filename mode: {args.filename_mode}")
-
     download_targets = build_download_targets(
         metadata,
         filename_mode=args.filename_mode,
     )
-
-    month_dir_master = f"{start.year:04d}_{start.month:02d}"
-    month_dir_local = f"{start.year:04d}-{start.month:02d}"
-
-    master_prefix = load_master_prefix()
-    if master_prefix is not None:
-        output_dir = master_prefix / month_dir_master / "ksef"
-        output_source = f"{(get_app_dir() / MASTER_PREFIX_FILE).resolve()} -> {output_dir.resolve()}"
-    else:
-        output_dir = get_app_dir() / DEFAULT_LOCAL_OUT_DIR / month_dir_local
-        output_source = f"default local path -> {output_dir.resolve()}"
-
-    tracking_file = output_dir / TRACKING_FILE_NAME
     tracked_ids = load_tracking_ids(tracking_file)
     already_tracked = sum(1 for invoice_id, _ in download_targets if invoice_id in tracked_ids)
 
-    if tracking_file.exists():
-        print(f"Tracking file source: {tracking_file.resolve()}")
-    else:
-        print(f"Tracking file source: {tracking_file.resolve()} (missing -> full redownload of untracked IDs)")
-
-    print(f"Tracked invoice IDs: {len(tracked_ids)}")
-    print(f"Already tracked in this run: {already_tracked}")
-    print(f"Target path source: {output_source}")
-    print(f"Output directory: {output_dir.resolve()}")
+    console_ok(f"Metadata rows fetched: {len(metadata)}")
+    console_info(f"Unique KSeF invoice numbers: {len(ksef_numbers)}")
+    console_info(f"Tracked invoice IDs: {len(tracked_ids)}")
+    console_info(f"Already tracked in this run: {already_tracked}")
 
     if args.dry_run:
+        console_section("Results")
+        console_warn("Dry run enabled. No files were downloaded or rendered.")
+        console_list("Downloaded invoices", [], empty_message="none (dry run)")
+        console_list("Rendered invoices", [], empty_message="none (dry run)")
         return 0
 
     try:
@@ -823,28 +919,46 @@ def main() -> int:
             overwrite=args.overwrite,
         )
     except KsefApiError as exc:
-        print(str(exc), file=sys.stderr)
+        console_error(str(exc))
         return 1
 
     write_tracking_ids(tracking_file, tracked_ids)
 
-    print(f"Downloaded XML files: {downloaded}")
-    print(f"Skipped existing files: {skipped}")
+    downloaded_names = [path.name for path in sorted(set(downloaded_xml_paths), key=lambda p: str(p))]
+
+    console_section("Results")
+    console_ok(f"Downloaded XML files: {downloaded}")
+    console_info(f"Skipped existing files: {skipped}")
+    console_list(
+        "Downloaded invoices",
+        downloaded_names,
+        empty_message="none",
+    )
 
     if args.render == "yes":
         if downloaded_xml_paths:
             try:
-                rendered, render_failed = render_downloaded_xmls(downloaded_xml_paths)
+                rendered_paths, render_failures = render_downloaded_xmls(downloaded_xml_paths)
             except KsefApiError as exc:
-                print(str(exc), file=sys.stderr)
+                console_error(str(exc))
                 return 1
-            print(f"Rendered PDF files: {rendered}")
-            print(f"Render failures: {render_failed}")
-            if render_failed > 0:
+            console_ok(f"Rendered PDF files: {len(rendered_paths)}")
+            console_list(
+                "Rendered invoices",
+                [path.name for path in rendered_paths],
+                empty_message="none",
+            )
+            if render_failures:
+                console_warn(f"Render failures: {len(render_failures)}")
+                for failure in render_failures:
+                    print(f"  - {colorize(failure, '33')}")
                 return 1
         else:
-            print("Rendered PDF files: 0")
-            print("Render failures: 0")
+            console_ok("Rendered PDF files: 0")
+            console_list("Rendered invoices", [], empty_message="none")
+    else:
+        console_info("PDF rendering disabled (--render no).")
+        console_list("Rendered invoices", [], empty_message="none (render disabled)")
 
     return 0
 
