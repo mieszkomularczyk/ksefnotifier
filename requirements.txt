@@ -1,5 +1,5 @@
 # Runtime dependencies
-cryptography>=46.0.5
+cryptography>=46.0.6
 fpdf2>=2.8.7
 qrcode>=8.2
 
