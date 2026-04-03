@@ -442,9 +442,36 @@ def to_iso8601(value: datetime) -> str:
     return value.isoformat(timespec="seconds")
 
 
+POLISH_FILENAME_CHAR_MAP = str.maketrans(
+    {
+        "ą": "a",
+        "ć": "c",
+        "ę": "e",
+        "ł": "l",
+        "ń": "n",
+        "ó": "o",
+        "ś": "s",
+        "ź": "z",
+        "ż": "z",
+        "Ą": "A",
+        "Ć": "C",
+        "Ę": "E",
+        "Ł": "L",
+        "Ń": "N",
+        "Ó": "O",
+        "Ś": "S",
+        "Ź": "Z",
+        "Ż": "Z",
+    }
+)
+
+
 def sanitize_filename(name: str) -> str:
+    # Filename-only transliteration: keep display text elsewhere unchanged.
+    normalized = name.translate(POLISH_FILENAME_CHAR_MAP)
+
     # Keep only characters safe on Windows/Linux filesystems.
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", normalized)
     return safe.strip("._") or "invoice"
 
 

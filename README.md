@@ -1,10 +1,33 @@
 # KSeF Notifier
 
+English documentation is first in this file. Polish documentation follows below.
+
 ## English
 
 ### What this project does
 
-`ksefnotifier` downloads purchase invoices from KSeF for your company and can also render each XML invoice into a readable PDF.
+`ksefnotifier` downloads purchase invoices from KSeF for your company, keeps track of what has already been downloaded, and can also render each XML invoice into a readable PDF.
+
+Default behavior when you run the downloader without parameters:
+
+- it downloads invoices for the current month
+- it uses the KSeF storage date (`PermanentStorage`) as the date filter
+- it downloads purchase invoices only (`Subject2`)
+- it uses `seller-id` as the default filename mode
+- it renders PDFs by default
+- if `dir_prefix.txt` does not exist or is empty, files are saved to `downloads/<YYYY-MM>` next to the script or executable
+- if `dir_prefix.txt` exists and contains a path, files are saved only to `<dir_prefix>/<YYYY_MM>/ksef`
+
+This is not a "download everything every time" script.
+
+Typical usage looks like this:
+
+1. You run the downloader.
+2. New invoices are downloaded.
+3. You review them, move them elsewhere, approve them, or import them into your accounting system.
+4. The script keeps `downloaded.txt` in the active target folder, so on the next run it downloads only invoices that were not tracked before.
+
+This means the script does not rely only on the presence of XML files in the directory. Even if some downloaded invoices are later moved out manually, `downloaded.txt` still tells the script which invoice IDs were already processed.
 
 Important limitations:
 
@@ -238,6 +261,8 @@ python download_current_month_invoices.py --filename-mode id
 
 Notes:
 
+- If you run the program without parameters, it downloads the current month.
+- If you run the program without parameters, it uses `PermanentStorage` as the date type.
 - Default filename mode is `seller-id`
 - Default render mode is `yes`
 - The script prints the token status, target directory, date range, and downloaded/rendered invoice list in the console
@@ -310,7 +335,28 @@ Place these files next to the executable if you want the default setup:
 
 ### Do czego sluzy ten projekt
 
-`ksefnotifier` pobiera z KSeF faktury zakupowe dla Twojej firmy i moze tez automatycznie wygenerowac czytelny PDF z kazdego pliku XML.
+`ksefnotifier` pobiera z KSeF faktury zakupowe dla Twojej firmy, pilnuje ktore faktury zostaly juz pobrane, i moze tez automatycznie wygenerowac czytelny PDF z kazdego pliku XML.
+
+Domyslne zachowanie po uruchomieniu downloadera bez parametrow:
+
+- pobierany jest biezacy miesiac
+- jako filtr daty uzywana jest data przechowywania w KSeF (`PermanentStorage`)
+- pobierane sa tylko faktury zakupowe (`Subject2`)
+- domyslny tryb nazewnictwa to `seller-id`
+- generowanie PDF jest domyslnie wlaczone
+- jesli `dir_prefix.txt` nie istnieje albo jest pusty, pliki trafiaja do `downloads/<YYYY-MM>` obok skryptu lub pliku wykonywalnego
+- jesli `dir_prefix.txt` istnieje i zawiera sciezke, pliki trafiaja tylko do `<dir_prefix>/<YYYY_MM>/ksef`
+
+To nie jest skrypt typu "za kazdym razem pobierz wszystko od nowa".
+
+Typowy scenariusz wyglada tak:
+
+1. Uruchamiasz downloader.
+2. Nowe faktury sa pobierane.
+3. Przegladasz je, przenosisz w inne miejsce, zatwierdzasz albo importujesz do systemu ksiegowego.
+4. Skrypt przechowuje `downloaded.txt` w aktywnym katalogu docelowym, dzieki czemu przy nastepnym uruchomieniu pobierze tylko faktury, ktore wczesniej nie byly zapisane na liscie.
+
+Oznacza to, ze skrypt nie opiera sie tylko na obecnosci plikow XML w katalogu. Nawet jesli czesc pobranych faktur zostanie pozniej recznie przeniesiona w inne miejsce, `downloaded.txt` nadal informuje skrypt, ktore identyfikatory faktur byly juz obsluzone.
 
 Wazne ograniczenia:
 
@@ -544,6 +590,8 @@ python download_current_month_invoices.py --filename-mode id
 
 Uwagi:
 
+- Jesli uruchomisz program bez parametrow, pobierany jest biezacy miesiac.
+- Jesli uruchomisz program bez parametrow, jako typ daty uzywany jest `PermanentStorage`.
 - Domyslny tryb nazewnictwa to `seller-id`
 - Domyslne renderowanie PDF jest wlaczone (`yes`)
 - Skrypt wypisuje w konsoli status tokena, katalog docelowy, zakres dat oraz liste pobranych i wyrenderowanych faktur
