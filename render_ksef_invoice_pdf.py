@@ -105,6 +105,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="In XML appendix skip rows with empty values.",
     )
+    parser.add_argument(
+        "--ksef-id",
+        default=None,
+        help="Optional KSeF ID to display in the PDF header (single XML input only).",
+    )
     return parser.parse_args()
 
 
@@ -367,8 +372,10 @@ def render_invoice_pdf(
     regular_font: Optional[Path],
     bold_font: Optional[Path],
     hide_empty_fields: bool,
+    ksef_id: Optional[str] = None,
 ) -> None:
     qr_temp_path: Optional[Path] = None
+    normalized_ksef_id = (ksef_id or "").strip()
 
     pdf = FPDF(orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=10)
@@ -390,6 +397,14 @@ def render_invoice_pdf(
         new_x="LMARGIN",
         new_y="NEXT",
     )
+    if normalized_ksef_id:
+        pdf.cell(
+            0,
+            6,
+            encode_text(f"Identyfikator KSeF: {normalized_ksef_id}", unicode_enabled),
+            new_x="LMARGIN",
+            new_y="NEXT",
+        )
     place = invoice.issue_place or "-"
     period_text = (
         f"Okres: {invoice.period_from} - {invoice.period_to}"
@@ -561,6 +576,10 @@ def main() -> int:
         print(f"No XML files found in {args.input}", file=sys.stderr)
         return 1
 
+    if args.ksef_id and len(xml_files) != 1:
+        print("Use --ksef-id only when rendering a single XML file.", file=sys.stderr)
+        return 2
+
     rendered = 0
     for xml_file in xml_files:
         try:
@@ -572,6 +591,7 @@ def main() -> int:
                 regular_font=args.font_regular,
                 bold_font=args.font_bold,
                 hide_empty_fields=args.hide_empty_fields,
+                ksef_id=args.ksef_id if len(xml_files) == 1 else None,
             )
             print(f"OK: {xml_file} -> {out_pdf}")
             rendered += 1

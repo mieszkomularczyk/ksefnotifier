@@ -757,10 +757,10 @@ def download_invoices(
     tracked_ids: set[str],
     *,
     overwrite: bool,
-) -> tuple[int, int, List[Path]]:
+) -> tuple[int, int, List[tuple[Path, str]]]:
     downloaded = 0
     skipped_existing = 0
-    downloaded_xml_paths: List[Path] = []
+    downloaded_xml_files: List[tuple[Path, str]] = []
 
     for directory in output_dirs:
         directory.mkdir(parents=True, exist_ok=True)
@@ -783,13 +783,13 @@ def download_invoices(
         tracked_ids.add(ksef_number)
         for target in targets_for_id:
             if target.exists():
-                downloaded_xml_paths.append(target)
+                downloaded_xml_files.append((target, ksef_number))
         downloaded += 1
 
-    return downloaded, skipped_existing, downloaded_xml_paths
+    return downloaded, skipped_existing, downloaded_xml_files
 
 
-def render_downloaded_xmls(xml_paths: Iterable[Path]) -> tuple[List[Path], List[str]]:
+def render_downloaded_xmls(xml_files: Iterable[tuple[Path, str]]) -> tuple[List[Path], List[str]]:
     try:
         from render_ksef_invoice_pdf import parse_invoice, render_invoice_pdf
     except Exception as exc:
@@ -798,8 +798,11 @@ def render_downloaded_xmls(xml_paths: Iterable[Path]) -> tuple[List[Path], List[
     rendered_paths: List[Path] = []
     failures: List[str] = []
 
-    unique_xml_paths = sorted(set(xml_paths), key=lambda p: str(p))
-    for xml_path in unique_xml_paths:
+    unique_xml_files: Dict[Path, str] = {}
+    for xml_path, ksef_id in xml_files:
+        unique_xml_files[xml_path] = ksef_id
+
+    for xml_path in sorted(unique_xml_files, key=lambda p: str(p)):
         pdf_path = xml_path.with_suffix(".pdf")
         try:
             invoice = parse_invoice(xml_path)
@@ -809,6 +812,7 @@ def render_downloaded_xmls(xml_paths: Iterable[Path]) -> tuple[List[Path], List[
                 regular_font=None,
                 bold_font=None,
                 hide_empty_fields=False,
+                ksef_id=unique_xml_files[xml_path],
             )
             rendered_paths.append(pdf_path)
         except Exception as exc:
@@ -938,7 +942,7 @@ def main() -> int:
         return 0
 
     try:
-        downloaded, skipped, downloaded_xml_paths = download_invoices(
+        downloaded, skipped, downloaded_xml_files = download_invoices(
             invoice_client,
             download_targets,
             [output_dir],
@@ -951,7 +955,10 @@ def main() -> int:
 
     write_tracking_ids(tracking_file, tracked_ids)
 
-    downloaded_names = [path.name for path in sorted(set(downloaded_xml_paths), key=lambda p: str(p))]
+    downloaded_name_map: Dict[Path, str] = {}
+    for xml_path, ksef_id in downloaded_xml_files:
+        downloaded_name_map[xml_path] = ksef_id
+    downloaded_names = [path.name for path in sorted(downloaded_name_map, key=lambda p: str(p))]
 
     console_section("Results")
     console_ok(f"Downloaded XML files: {downloaded}")
@@ -963,9 +970,9 @@ def main() -> int:
     )
 
     if args.render == "yes":
-        if downloaded_xml_paths:
+        if downloaded_xml_files:
             try:
-                rendered_paths, render_failures = render_downloaded_xmls(downloaded_xml_paths)
+                rendered_paths, render_failures = render_downloaded_xmls(downloaded_xml_files)
             except KsefApiError as exc:
                 console_error(str(exc))
                 return 1
