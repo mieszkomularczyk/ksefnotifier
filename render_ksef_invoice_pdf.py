@@ -15,7 +15,7 @@ import sys
 import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -34,6 +34,8 @@ PAYMENT_METHOD_BY_CODE = {
     "7": "Inna",
 }
 
+MONEY_QUANT = Decimal("0.01")
+
 
 @dataclass
 class Party:
@@ -48,16 +50,20 @@ class InvoiceItem:
     description: str
     unit: str
     quantity: Decimal
-    unit_net: Decimal
+    unit_price: Decimal
+    unit_price_kind: str
     net_amount: Decimal
     vat_rate: str
     vat_amount: Decimal
+    gross_amount: Decimal
+    before_correction: str
 
 
 @dataclass
 class InvoiceData:
     invoice_number: str
     issue_date: str
+    sale_date: str
     issue_place: str
     currency: str
     invoice_type: str
@@ -75,6 +81,9 @@ class InvoiceData:
     gross_total: Decimal
     qr_url: str
     all_fields: list[tuple[str, str]]
+    visualized_fields: set[str]
+    schema_note_rows: list[tuple[str, str]]
+    correction_rows: list[tuple[str, str]]
 
 
 def parse_args() -> argparse.Namespace:
@@ -120,15 +129,53 @@ def strip_namespace(tag_name: str) -> str:
 
 
 def parse_decimal(raw: Optional[str]) -> Decimal:
+    value = parse_optional_decimal(raw)
+    return value if value is not None else Decimal("0")
+
+
+def parse_optional_decimal(raw: Optional[str]) -> Optional[Decimal]:
     if raw is None:
-        return Decimal("0")
+        return None
     text = raw.strip().replace(",", ".")
     if not text:
-        return Decimal("0")
+        return None
     try:
         return Decimal(text)
     except InvalidOperation:
+        return None
+
+
+def child_decimal(parent: Optional[ET.Element], ns_uri: str, tag_name: str) -> Optional[Decimal]:
+    return parse_optional_decimal(child_text(parent, ns_uri, tag_name))
+
+
+def parse_vat_rate(vat_rate: str) -> Optional[Decimal]:
+    if not vat_rate:
+        return None
+    first_token = vat_rate.strip().replace(",", ".").split()[0]
+    return parse_optional_decimal(first_token)
+
+
+def round_money(value: Decimal) -> Decimal:
+    return value.quantize(MONEY_QUANT, rounding=ROUND_HALF_UP)
+
+
+def derive_net_from_gross(gross_amount: Decimal, vat_rate: str) -> Decimal:
+    rate = parse_vat_rate(vat_rate)
+    if rate is None or rate == Decimal("0"):
+        return round_money(gross_amount)
+    return round_money(gross_amount * Decimal("100") / (Decimal("100") + rate))
+
+
+def derive_vat_from_net(net_amount: Decimal, vat_rate: str) -> Decimal:
+    rate = parse_vat_rate(vat_rate)
+    if rate is None or rate == Decimal("0"):
         return Decimal("0")
+    return round_money(net_amount * rate / Decimal("100"))
+
+
+def derive_vat_from_gross(gross_amount: Decimal, vat_rate: str) -> Decimal:
+    return round_money(gross_amount - derive_net_from_gross(gross_amount, vat_rate))
 
 
 def tag_with_ns(ns_uri: str, tag_name: str) -> str:
@@ -142,6 +189,12 @@ def child_text(parent: Optional[ET.Element], ns_uri: str, tag_name: str, default
     if node is None or node.text is None:
         return default
     return node.text.strip()
+
+
+def child_node(parent: Optional[ET.Element], ns_uri: str, tag_name: str) -> Optional[ET.Element]:
+    if parent is None:
+        return None
+    return parent.find(tag_with_ns(ns_uri, tag_name))
 
 
 def sum_numbered_fields(parent: ET.Element, ns_uri: str, prefix: str, max_idx: int = 12) -> Decimal:
@@ -199,6 +252,176 @@ def flatten_xml_fields(node: ET.Element, path: str, out_rows: list[tuple[str, st
         flatten_xml_fields(child, current_path, out_rows)
 
 
+def invoice_path(*parts: str) -> str:
+    return "/".join(("Faktura", *parts))
+
+
+def flag_yes_no(value: str, *, yes_value: str = "1") -> str:
+    if value == yes_value:
+        return "TAK"
+    if value:
+        return "NIE"
+    return "-"
+
+
+def flag_no_yes(value: str, *, no_value: str = "1") -> str:
+    if value == no_value:
+        return "NIE"
+    if value:
+        return "TAK"
+    return "-"
+
+
+def before_correction_label(value: str) -> str:
+    if value == "1":
+        return "Tak"
+    if value:
+        return "Nie"
+    return ""
+
+
+def correction_invoice_type_label(invoice_type: str) -> str:
+    if invoice_type == "KOR":
+        return "Faktura korygujaca"
+    return "Faktura VAT"
+
+
+def build_correction_rows(fa: ET.Element, ns_uri: str) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    for corrected in fa.findall(tag_with_ns(ns_uri, "DaneFaKorygowanej")):
+        date = child_text(corrected, ns_uri, "DataWystFaKorygowanej")
+        number = child_text(corrected, ns_uri, "NrFaKorygowanej")
+        has_ksef_number = child_text(corrected, ns_uri, "NrKSeF")
+        ksef_number = child_text(corrected, ns_uri, "NrKSeFFaKorygowanej")
+        outside_ksef = child_text(corrected, ns_uri, "NrKSeFN")
+
+        if date:
+            rows.append(("Data wystawienia faktury korygowanej", date))
+        if number:
+            rows.append(("Numer faktury korygowanej", number))
+        if has_ksef_number:
+            rows.append(("Faktura korygowana wystawiona w KSeF", flag_yes_no(has_ksef_number)))
+        if ksef_number:
+            rows.append(("Numer KSeF faktury korygowanej", ksef_number))
+        if outside_ksef:
+            rows.append(("Faktura korygowana wystawiona poza KSeF", flag_yes_no(outside_ksef)))
+
+    return rows
+
+
+def build_schema_note_rows(root: ET.Element, fa: ET.Element, ns_uri: str) -> list[tuple[str, str]]:
+    header = child_node(root, ns_uri, "Naglowek")
+    form_code = child_node(header, ns_uri, "KodFormularza")
+    form_code_text = (form_code.text or "").strip() if form_code is not None and form_code.text else ""
+    system_code = form_code.attrib.get("kodSystemowy", "") if form_code is not None else ""
+    schema_version = form_code.attrib.get("wersjaSchemy", "") if form_code is not None else ""
+
+    rows: list[tuple[str, str]] = []
+    if form_code_text or system_code or schema_version:
+        value_parts = [part for part in [form_code_text, system_code, f"wersja schemy {schema_version}" if schema_version else ""] if part]
+        rows.append(("Kod formularza", " / ".join(value_parts)))
+
+    for label, value in [
+        ("Wariant formularza", child_text(header, ns_uri, "WariantFormularza")),
+        ("Data wytworzenia XML", child_text(header, ns_uri, "DataWytworzeniaFa")),
+        ("System wystawcy", child_text(header, ns_uri, "SystemInfo")),
+    ]:
+        if value:
+            rows.append((label, value))
+
+    buyer = child_node(root, ns_uri, "Podmiot2")
+    rows.extend(
+        [
+            ("Faktura dotyczy jednostki podrzednej JST", flag_yes_no(child_text(buyer, ns_uri, "JST"))),
+            ("Faktura dotyczy czlonka grupy VAT (GV)", flag_yes_no(child_text(buyer, ns_uri, "GV"))),
+        ]
+    )
+
+    notes = child_node(fa, ns_uri, "Adnotacje")
+    exemption = child_node(notes, ns_uri, "Zwolnienie")
+    new_transport = child_node(notes, ns_uri, "NoweSrodkiTransportu")
+    margin = child_node(notes, ns_uri, "PMarzy")
+    rows.extend(
+        [
+            ("Metoda kasowa", flag_yes_no(child_text(notes, ns_uri, "P_16"))),
+            ("Samofakturowanie", flag_yes_no(child_text(notes, ns_uri, "P_17"))),
+            ("Odwrotne obciazenie", flag_yes_no(child_text(notes, ns_uri, "P_18"))),
+            ("Mechanizm podzielonej platnosci", flag_yes_no(child_text(notes, ns_uri, "P_18A"))),
+            ("Sprzedaz zwolniona", flag_no_yes(child_text(exemption, ns_uri, "P_19N"))),
+            ("WDT nowych srodkow transportu", flag_no_yes(child_text(new_transport, ns_uri, "P_22N"))),
+            ("Procedura uproszczona transakcji trojstronnej UE", flag_yes_no(child_text(notes, ns_uri, "P_23"))),
+            ("Procedura marzy", flag_no_yes(child_text(margin, ns_uri, "P_PMarzyN"))),
+        ]
+    )
+
+    return [(label, value) for label, value in rows if value != "-"]
+
+
+def build_visualized_field_paths(all_fields: list[tuple[str, str]]) -> set[str]:
+    paths = {
+        invoice_path("Podmiot1", "DaneIdentyfikacyjne", "Nazwa"),
+        invoice_path("Podmiot1", "DaneIdentyfikacyjne", "NIP"),
+        invoice_path("Podmiot1", "Adres", "KodKraju"),
+        invoice_path("Podmiot1", "Adres", "AdresL1"),
+        invoice_path("Podmiot1", "Adres", "AdresL2"),
+        invoice_path("Podmiot2", "DaneIdentyfikacyjne", "Nazwa"),
+        invoice_path("Podmiot2", "DaneIdentyfikacyjne", "NIP"),
+        invoice_path("Podmiot2", "Adres", "KodKraju"),
+        invoice_path("Podmiot2", "Adres", "AdresL1"),
+        invoice_path("Podmiot2", "Adres", "AdresL2"),
+        invoice_path("Fa", "KodWaluty"),
+        invoice_path("Fa", "P_1"),
+        invoice_path("Fa", "P_1M"),
+        invoice_path("Fa", "P_2"),
+        invoice_path("Fa", "P_6"),
+        invoice_path("Fa", "OkresFa", "P_6_Od"),
+        invoice_path("Fa", "OkresFa", "P_6_Do"),
+        invoice_path("Fa", "RodzajFaktury"),
+        invoice_path("Fa", "P_15"),
+        invoice_path("Fa", "FaWiersz", "NrWierszaFa"),
+        invoice_path("Fa", "FaWiersz", "P_7"),
+        invoice_path("Fa", "FaWiersz", "P_8A"),
+        invoice_path("Fa", "FaWiersz", "P_8B"),
+        invoice_path("Fa", "FaWiersz", "P_9A"),
+        invoice_path("Fa", "FaWiersz", "P_9B"),
+        invoice_path("Fa", "FaWiersz", "P_11"),
+        invoice_path("Fa", "FaWiersz", "P_11A"),
+        invoice_path("Fa", "FaWiersz", "P_11Vat"),
+        invoice_path("Fa", "FaWiersz", "P_12"),
+        invoice_path("Fa", "FaWiersz", "StanPrzed"),
+        invoice_path("Fa", "Platnosc", "TerminPlatnosci", "Termin"),
+        invoice_path("Fa", "Platnosc", "FormaPlatnosci"),
+        invoice_path("Fa", "Platnosc", "RachunekBankowy", "NrRB"),
+        invoice_path("Fa", "Platnosc", "RachunekBankowy", "NazwaBanku"),
+        invoice_path("Fa", "DaneFaKorygowanej", "DataWystFaKorygowanej"),
+        invoice_path("Fa", "DaneFaKorygowanej", "NrFaKorygowanej"),
+        invoice_path("Fa", "DaneFaKorygowanej", "NrKSeF"),
+        invoice_path("Fa", "DaneFaKorygowanej", "NrKSeFFaKorygowanej"),
+        invoice_path("Fa", "DaneFaKorygowanej", "NrKSeFN"),
+        invoice_path("Naglowek", "KodFormularza@kodSystemowy"),
+        invoice_path("Naglowek", "KodFormularza@wersjaSchemy"),
+        invoice_path("Naglowek", "KodFormularza"),
+        invoice_path("Naglowek", "WariantFormularza"),
+        invoice_path("Naglowek", "DataWytworzeniaFa"),
+        invoice_path("Naglowek", "SystemInfo"),
+        invoice_path("Podmiot2", "JST"),
+        invoice_path("Podmiot2", "GV"),
+        invoice_path("Fa", "Adnotacje", "P_16"),
+        invoice_path("Fa", "Adnotacje", "P_17"),
+        invoice_path("Fa", "Adnotacje", "P_18"),
+        invoice_path("Fa", "Adnotacje", "P_18A"),
+        invoice_path("Fa", "Adnotacje", "Zwolnienie", "P_19N"),
+        invoice_path("Fa", "Adnotacje", "NoweSrodkiTransportu", "P_22N"),
+        invoice_path("Fa", "Adnotacje", "P_23"),
+        invoice_path("Fa", "Adnotacje", "PMarzy", "P_PMarzyN"),
+    }
+    for key, _ in all_fields:
+        leaf_name = key.rsplit("/", 1)[-1]
+        if leaf_name.startswith("P_13_") or leaf_name.startswith("P_14_"):
+            paths.add(key)
+    return paths
+
+
 def parse_invoice(xml_path: Path) -> InvoiceData:
     xml_bytes = xml_path.read_bytes()
     root = ET.fromstring(xml_bytes)
@@ -215,16 +438,54 @@ def parse_invoice(xml_path: Path) -> InvoiceData:
 
     items: list[InvoiceItem] = []
     for row in fa.findall(tag_with_ns(ns_uri, "FaWiersz")):
+        vat_rate = child_text(row, ns_uri, "P_12")
+        unit_net = child_decimal(row, ns_uri, "P_9A")
+        unit_gross = child_decimal(row, ns_uri, "P_9B")
+        net_amount_raw = child_decimal(row, ns_uri, "P_11")
+        gross_amount_raw = child_decimal(row, ns_uri, "P_11A")
+        vat_amount_raw = child_decimal(row, ns_uri, "P_11Vat")
+
+        # FA(3) line values can be expressed either net (P_9A/P_11) or gross (P_9B/P_11A).
+        if gross_amount_raw is not None:
+            gross_amount = gross_amount_raw
+            net_amount = net_amount_raw if net_amount_raw is not None else derive_net_from_gross(gross_amount, vat_rate)
+        else:
+            net_amount = net_amount_raw if net_amount_raw is not None else Decimal("0")
+            gross_amount = net_amount
+
+        if vat_amount_raw is not None:
+            vat_amount = vat_amount_raw
+        elif gross_amount_raw is not None:
+            vat_amount = derive_vat_from_gross(gross_amount, vat_rate)
+        else:
+            vat_amount = derive_vat_from_net(net_amount, vat_rate)
+
+        if gross_amount_raw is None:
+            gross_amount = net_amount + vat_amount
+
+        if unit_net is not None:
+            unit_price = unit_net
+            unit_price_kind = "net"
+        elif unit_gross is not None:
+            unit_price = unit_gross
+            unit_price_kind = "gross"
+        else:
+            unit_price = Decimal("0")
+            unit_price_kind = ""
+
         items.append(
             InvoiceItem(
                 line_no=child_text(row, ns_uri, "NrWierszaFa"),
                 description=child_text(row, ns_uri, "P_7"),
                 unit=child_text(row, ns_uri, "P_8A"),
                 quantity=parse_decimal(child_text(row, ns_uri, "P_8B")),
-                unit_net=parse_decimal(child_text(row, ns_uri, "P_9A")),
-                net_amount=parse_decimal(child_text(row, ns_uri, "P_11")),
-                vat_rate=child_text(row, ns_uri, "P_12"),
-                vat_amount=parse_decimal(child_text(row, ns_uri, "P_11Vat")),
+                unit_price=unit_price,
+                unit_price_kind=unit_price_kind,
+                net_amount=net_amount,
+                vat_rate=vat_rate,
+                vat_amount=vat_amount,
+                gross_amount=gross_amount,
+                before_correction=before_correction_label(child_text(row, ns_uri, "StanPrzed")),
             )
         )
 
@@ -261,6 +522,7 @@ def parse_invoice(xml_path: Path) -> InvoiceData:
     return InvoiceData(
         invoice_number=child_text(fa, ns_uri, "P_2"),
         issue_date=child_text(fa, ns_uri, "P_1"),
+        sale_date=child_text(fa, ns_uri, "P_6"),
         issue_place=child_text(fa, ns_uri, "P_1M"),
         currency=child_text(fa, ns_uri, "KodWaluty", "PLN"),
         invoice_type=child_text(fa, ns_uri, "RodzajFaktury", "VAT"),
@@ -278,11 +540,14 @@ def parse_invoice(xml_path: Path) -> InvoiceData:
         gross_total=gross_total,
         qr_url=qr_url,
         all_fields=all_fields,
+        visualized_fields=build_visualized_field_paths(all_fields),
+        schema_note_rows=build_schema_note_rows(root, fa, ns_uri),
+        correction_rows=build_correction_rows(fa, ns_uri),
     )
 
 
 def format_amount(value: Decimal, currency: str) -> str:
-    fixed = value.quantize(Decimal("0.01"))
+    fixed = round_money(value)
     text = f"{fixed:,.2f}".replace(",", " ").replace(".", ",")
     return f"{text} {currency}"
 
@@ -292,6 +557,15 @@ def format_qty(value: Decimal) -> str:
     if normalized == normalized.to_integral():
         return str(normalized.quantize(Decimal("1")))
     return f"{normalized:f}"
+
+
+def unit_price_heading(items: list[InvoiceItem]) -> str:
+    kinds = {item.unit_price_kind for item in items if item.unit_price_kind}
+    if kinds == {"gross"}:
+        return "Cena brutto"
+    if kinds == {"net"}:
+        return "Cena netto"
+    return "Cena jedn."
 
 
 def discover_system_font_pair() -> Optional[tuple[Path, Path]]:
@@ -384,8 +658,9 @@ def render_invoice_pdf(
 
     family, unicode_enabled = configure_font(pdf, regular_font, bold_font)
 
+    invoice_type_label = correction_invoice_type_label(invoice.invoice_type)
     pdf.set_font(family, "B", 17)
-    pdf.cell(0, 10, encode_text("Faktura VAT - wizualizacja z XML KSeF", unicode_enabled), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 10, encode_text(f"{invoice_type_label} - wizualizacja z XML KSeF", unicode_enabled), new_x="LMARGIN", new_y="NEXT")
     pdf.set_font(family, "", 10)
     pdf.cell(
         0,
@@ -406,6 +681,7 @@ def render_invoice_pdf(
             new_y="NEXT",
         )
     place = invoice.issue_place or "-"
+    sale_date = invoice.sale_date or "-"
     period_text = (
         f"Okres: {invoice.period_from} - {invoice.period_to}"
         if invoice.period_from or invoice.period_to
@@ -414,31 +690,86 @@ def render_invoice_pdf(
     pdf.cell(
         0,
         6,
-        encode_text(f"Miejsce wystawienia: {place}   {period_text}", unicode_enabled),
+        encode_text(
+            f"Miejsce wystawienia: {place}   Data sprzedazy: {sale_date}   {period_text}",
+            unicode_enabled,
+        ),
         new_x="LMARGIN",
         new_y="NEXT",
     )
     pdf.ln(2)
 
+    if invoice.correction_rows:
+        pdf.set_fill_color(243, 245, 248)
+        pdf.set_font(family, "B", 11)
+        pdf.cell(0, 8, encode_text("Dane faktury korygowanej", unicode_enabled), new_x="LMARGIN", new_y="NEXT", fill=True)
+        pdf.set_font(family, "", 9)
+        for label, value in invoice.correction_rows:
+            pdf.cell(62, 6, encode_text(label, unicode_enabled), border=1)
+            pdf.cell(0, 6, encode_text(value, unicode_enabled), border=1, new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(2)
+
     draw_party_block(pdf, "Sprzedawca", invoice.seller, family, unicode_enabled)
     draw_party_block(pdf, "Nabywca", invoice.buyer, family, unicode_enabled)
+
+    if invoice.schema_note_rows:
+        pdf.set_fill_color(243, 245, 248)
+        pdf.set_font(family, "B", 11)
+        pdf.cell(0, 8, encode_text("Dane KSeF i oznaczenia", unicode_enabled), new_x="LMARGIN", new_y="NEXT", fill=True)
+        pdf.set_font(family, "", 8)
+        with pdf.table(
+            width=pdf.epw,
+            col_widths=(48, 44, 48, 45),
+            line_height=4.5,
+            first_row_as_headings=False,
+            text_align=("L", "L", "L", "L"),
+        ) as table:
+            rows = invoice.schema_note_rows
+            for idx in range(0, len(rows), 2):
+                row = table.row()
+                left_label, left_value = rows[idx]
+                row.cell(encode_text(left_label, unicode_enabled))
+                row.cell(encode_text(left_value, unicode_enabled))
+                if idx + 1 < len(rows):
+                    right_label, right_value = rows[idx + 1]
+                    row.cell(encode_text(right_label, unicode_enabled))
+                    row.cell(encode_text(right_value, unicode_enabled))
+                else:
+                    row.cell("")
+                    row.cell("")
+        pdf.ln(2)
 
     pdf.set_fill_color(243, 245, 248)
     pdf.set_font(family, "B", 11)
     pdf.cell(0, 8, encode_text("Pozycje faktury", unicode_enabled), new_x="LMARGIN", new_y="NEXT", fill=True)
-    pdf.set_font(family, "", 9)
+    pdf.set_font(family, "", 8)
+
+    show_before_correction = any(item.before_correction for item in invoice.items)
+    item_col_widths = (
+        (6, 42, 7, 9, 16, 14, 9, 13, 15, 14)
+        if show_before_correction
+        else (6, 54, 8, 10, 17, 16, 10, 15, 16)
+    )
+    item_text_align = (
+        ("C", "L", "C", "R", "R", "R", "R", "R", "R", "C")
+        if show_before_correction
+        else ("C", "L", "C", "R", "R", "R", "R", "R", "R")
+    )
+    item_labels = ["Lp", "Opis", "JM", "Ilosc", unit_price_heading(invoice.items), "Netto", "VAT%", "VAT", "Brutto"]
+    if show_before_correction:
+        item_labels.append("Stan przed")
 
     headings_style = FontFace(emphasis="B")
     with pdf.table(
         width=pdf.epw,
-        col_widths=(6, 66, 10, 11, 17, 16, 12, 16),
+        col_widths=item_col_widths,
         line_height=5,
         first_row_as_headings=True,
-        text_align=("C", "L", "C", "R", "R", "R", "R", "R"),
+        text_align=item_text_align,
         headings_style=headings_style,
     ) as table:
         header = table.row()
-        for label in ["Lp", "Opis", "JM", "Ilosc", "Cena netto", "Netto", "VAT%", "VAT"]:
+        for label in item_labels:
             header.cell(encode_text(label, unicode_enabled))
 
         for item in invoice.items:
@@ -447,10 +778,13 @@ def render_invoice_pdf(
             row.cell(encode_text(item.description or "-", unicode_enabled))
             row.cell(encode_text(item.unit or "-", unicode_enabled))
             row.cell(encode_text(format_qty(item.quantity), unicode_enabled))
-            row.cell(encode_text(format_amount(item.unit_net, invoice.currency), unicode_enabled))
+            row.cell(encode_text(format_amount(item.unit_price, invoice.currency), unicode_enabled))
             row.cell(encode_text(format_amount(item.net_amount, invoice.currency), unicode_enabled))
             row.cell(encode_text(item.vat_rate or "-", unicode_enabled))
             row.cell(encode_text(format_amount(item.vat_amount, invoice.currency), unicode_enabled))
+            row.cell(encode_text(format_amount(item.gross_amount, invoice.currency), unicode_enabled))
+            if show_before_correction:
+                row.cell(encode_text(item.before_correction, unicode_enabled))
 
     pdf.ln(2)
     pdf.set_fill_color(243, 245, 248)
@@ -510,7 +844,18 @@ def render_invoice_pdf(
     pdf.set_font(family, "B", 12)
     pdf.cell(0, 8, encode_text("Pola XML (sciezka -> wartosc)", unicode_enabled), new_x="LMARGIN", new_y="NEXT", fill=True)
     pdf.set_font(family, "", 8)
+    pdf.set_text_color(190, 30, 30)
+    pdf.cell(
+        0,
+        5,
+        encode_text("Czerwone pola nie maja reprezentacji na pierwszej stronie PDF.", unicode_enabled),
+        new_x="LMARGIN",
+        new_y="NEXT",
+    )
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_font(family, "", 8)
 
+    missing_field_style = FontFace(color=(190, 30, 30))
     with pdf.table(
         width=pdf.epw,
         col_widths=(92, 93),
@@ -526,9 +871,10 @@ def render_invoice_pdf(
         for key, value in invoice.all_fields:
             if hide_empty_fields and not value:
                 continue
+            field_style = None if key in invoice.visualized_fields else missing_field_style
             row = table.row()
-            row.cell(encode_text(key, unicode_enabled))
-            row.cell(encode_text(value if value else "", unicode_enabled))
+            row.cell(encode_text(key, unicode_enabled), style=field_style)
+            row.cell(encode_text(value if value else "", unicode_enabled), style=field_style)
 
     try:
         pdf.output(str(pdf_path))
