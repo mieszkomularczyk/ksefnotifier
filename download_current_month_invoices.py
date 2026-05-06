@@ -43,9 +43,10 @@ DEFAULT_RENDER_MODE = "yes"
 DEFAULT_TIMEZONE = "Europe/Warsaw"
 DEFAULT_LOCAL_OUT_DIR = "downloads"
 DEFAULT_TOKEN_FILE = "token.txt"
-SELLER_NAME_MAX_LEN = 15
+COUNTERPARTY_NAME_MAX_LEN = 15
 TRACKING_FILE_NAME = "downloaded.txt"
 MASTER_PREFIX_FILE = "dir_prefix.txt"
+ACCESS_TOKEN_REFRESH_MARGIN_SECONDS = 60
 RATE_LIMIT_RETRY_BUFFER_SECONDS = 0.2
 DEFAULT_RATE_LIMIT_MAX_RETRIES = 8
 FALLBACK_RATE_LIMITS = {
@@ -168,6 +169,8 @@ class AuthResult:
     access_token: str
     refresh_token: str
     reference_number: str
+    access_token_valid_until: datetime
+    refresh_token_valid_until: datetime
 
 
 @dataclass
@@ -177,6 +180,8 @@ class KsefClient:
     timeout_seconds: int = 60
     rate_limiters: Optional[Dict[str, SlidingWindowRateLimiter]] = None
     max_rate_limit_retries: int = DEFAULT_RATE_LIMIT_MAX_RETRIES
+    refresh_token: Optional[str] = None
+    access_token_valid_until: Optional[datetime] = None
 
     def _request(
         self,
@@ -188,6 +193,7 @@ class KsefClient:
         accept: str = "application/json",
         bearer_token: Optional[str] = None,
         rate_group: Optional[str] = None,
+        allow_token_refresh: bool = True,
     ) -> bytes:
         base = self.base_url.rstrip("/")
         url = f"{base}/{path.lstrip('/')}"
@@ -197,25 +203,30 @@ class KsefClient:
             url = f"{url}?{query_string}"
 
         data: Optional[bytes] = None
-        headers = {"Accept": accept}
-
-        effective_bearer = bearer_token if bearer_token is not None else self.bearer_token
-        if effective_bearer:
-            headers["Authorization"] = f"Bearer {effective_bearer}"
+        base_headers = {"Accept": accept}
 
         if json_body is not None:
             data = json.dumps(json_body).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-
-        request = Request(url=url, method=method.upper(), data=data, headers=headers)
+            base_headers["Content-Type"] = "application/json"
 
         limiter = self.rate_limiters.get(rate_group) if self.rate_limiters and rate_group else None
 
         attempts = 0
+        token_refreshed_after_401 = False
         while True:
+            if bearer_token is None and allow_token_refresh:
+                self.refresh_access_token_if_needed()
+
             if limiter is not None:
                 limiter.wait_for_slot()
                 limiter.record_request()
+
+            effective_bearer = bearer_token if bearer_token is not None else self.bearer_token
+            headers = dict(base_headers)
+            if effective_bearer:
+                headers["Authorization"] = f"Bearer {effective_bearer}"
+
+            request = Request(url=url, method=method.upper(), data=data, headers=headers)
 
             try:
                 with urlopen(request, timeout=self.timeout_seconds) as response:
@@ -234,6 +245,17 @@ class KsefClient:
                     )
                     time.sleep(retry_after)
                     continue
+                if (
+                    exc.code == 401
+                    and bearer_token is None
+                    and allow_token_refresh
+                    and self.refresh_token
+                    and not token_refreshed_after_401
+                ):
+                    token_refreshed_after_401 = True
+                    console_warn("Access token was rejected; refreshing token and retrying request")
+                    self.refresh_access_token(force=True)
+                    continue
                 raise KsefApiError(
                     f"KSeF API error {exc.code} for {method.upper()} {url}: {body}",
                     status_code=exc.code,
@@ -251,6 +273,7 @@ class KsefClient:
         json_body: Optional[Dict[str, Any]] = None,
         bearer_token: Optional[str] = None,
         rate_group: Optional[str] = None,
+        allow_token_refresh: bool = True,
     ) -> Dict[str, Any]:
         payload = self._request(
             "POST",
@@ -260,6 +283,7 @@ class KsefClient:
             accept="application/json",
             bearer_token=bearer_token,
             rate_group=rate_group,
+            allow_token_refresh=allow_token_refresh,
         )
         try:
             return json.loads(payload.decode("utf-8"))
@@ -275,6 +299,7 @@ class KsefClient:
         query: Optional[Dict[str, Any]] = None,
         bearer_token: Optional[str] = None,
         rate_group: Optional[str] = None,
+        allow_token_refresh: bool = True,
     ) -> Any:
         payload = self._request(
             "GET",
@@ -283,6 +308,7 @@ class KsefClient:
             accept="application/json",
             bearer_token=bearer_token,
             rate_group=rate_group,
+            allow_token_refresh=allow_token_refresh,
         )
         try:
             return json.loads(payload.decode("utf-8"))
@@ -297,6 +323,7 @@ class KsefClient:
         *,
         bearer_token: Optional[str] = None,
         rate_group: Optional[str] = None,
+        allow_token_refresh: bool = True,
     ) -> str:
         payload = self._request(
             "GET",
@@ -304,8 +331,46 @@ class KsefClient:
             accept="application/xml",
             bearer_token=bearer_token,
             rate_group=rate_group,
+            allow_token_refresh=allow_token_refresh,
         )
         return payload.decode("utf-8", errors="replace")
+
+    def refresh_access_token_if_needed(self) -> None:
+        if not self.refresh_token or not self.access_token_valid_until:
+            return
+
+        now = datetime.now(self.access_token_valid_until.tzinfo)
+        seconds_left = (self.access_token_valid_until - now).total_seconds()
+        if seconds_left <= ACCESS_TOKEN_REFRESH_MARGIN_SECONDS:
+            self.refresh_access_token(force=True)
+
+    def refresh_access_token(self, *, force: bool = False) -> None:
+        if not self.refresh_token:
+            return
+
+        if not force and self.access_token_valid_until:
+            now = datetime.now(self.access_token_valid_until.tzinfo)
+            seconds_left = (self.access_token_valid_until - now).total_seconds()
+            if seconds_left > ACCESS_TOKEN_REFRESH_MARGIN_SECONDS:
+                return
+
+        response = self.post_json(
+            "/auth/token/refresh",
+            bearer_token=self.refresh_token,
+            allow_token_refresh=False,
+        )
+        access_obj = response.get("accessToken") if isinstance(response, dict) else None
+        access_token = access_obj.get("token") if isinstance(access_obj, dict) else None
+        valid_until = access_obj.get("validUntil") if isinstance(access_obj, dict) else None
+
+        if not isinstance(access_token, str) or not access_token:
+            raise KsefApiError("Invalid /auth/token/refresh response: missing accessToken.token")
+        if not isinstance(valid_until, str) or not valid_until:
+            raise KsefApiError("Invalid /auth/token/refresh response: missing accessToken.validUntil")
+
+        self.bearer_token = access_token
+        self.access_token_valid_until = parse_datetime(valid_until)
+        console_ok(f"Access token refreshed. Valid until: {self.access_token_valid_until.isoformat(timespec='seconds')}")
 
 
 def get_app_dir() -> Path:
@@ -457,7 +522,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Output filename mode: "
             "'id' -> <ksefNumber>.xml, "
-            "'seller-id' -> <sellerNamePrefix15>__<ksefNumber>.xml"
+            "'seller-id' -> <counterpartyNamePrefix15>__<ksefNumber>.xml "
+            "(seller for purchase invoices, buyer for sales invoices)"
         ),
     )
     parser.add_argument(
@@ -833,16 +899,24 @@ def authenticate_by_ksef_token(
     refresh_obj = tokens_response.get("refreshToken") if isinstance(tokens_response, dict) else None
     access_token = access_obj.get("token") if isinstance(access_obj, dict) else None
     refresh_token = refresh_obj.get("token") if isinstance(refresh_obj, dict) else None
+    access_valid_until = access_obj.get("validUntil") if isinstance(access_obj, dict) else None
+    refresh_valid_until = refresh_obj.get("validUntil") if isinstance(refresh_obj, dict) else None
 
     if not isinstance(access_token, str) or not access_token:
         raise KsefApiError("Invalid /auth/token/redeem response: missing accessToken.token")
     if not isinstance(refresh_token, str) or not refresh_token:
         raise KsefApiError("Invalid /auth/token/redeem response: missing refreshToken.token")
+    if not isinstance(access_valid_until, str) or not access_valid_until:
+        raise KsefApiError("Invalid /auth/token/redeem response: missing accessToken.validUntil")
+    if not isinstance(refresh_valid_until, str) or not refresh_valid_until:
+        raise KsefApiError("Invalid /auth/token/redeem response: missing refreshToken.validUntil")
 
     return AuthResult(
         access_token=access_token,
         refresh_token=refresh_token,
         reference_number=reference_number,
+        access_token_valid_until=parse_datetime(access_valid_until),
+        refresh_token_valid_until=parse_datetime(refresh_valid_until),
     )
 
 
@@ -923,9 +997,11 @@ def build_download_targets(
     invoices: Iterable[Dict[str, Any]],
     *,
     filename_mode: str,
+    invoice_type: str,
 ) -> List[tuple[str, str]]:
     targets: List[tuple[str, str]] = []
     seen: set[str] = set()
+    counterparty_field = "buyer" if invoice_type == "sales" else "seller"
 
     for invoice in invoices:
         ksef_number = invoice.get("ksefNumber")
@@ -934,14 +1010,14 @@ def build_download_targets(
         seen.add(ksef_number)
 
         if filename_mode == "seller-id":
-            seller_name = ""
-            seller = invoice.get("seller")
-            if isinstance(seller, dict):
-                name_raw = seller.get("name")
+            counterparty_name = ""
+            counterparty = invoice.get(counterparty_field)
+            if isinstance(counterparty, dict):
+                name_raw = counterparty.get("name")
                 if isinstance(name_raw, str):
-                    seller_name = name_raw
-            seller_prefix = sanitize_filename(seller_name)[:SELLER_NAME_MAX_LEN]
-            file_stem = f"{seller_prefix}__{ksef_number}" if seller_prefix else ksef_number
+                    counterparty_name = name_raw
+            counterparty_prefix = sanitize_filename(counterparty_name)[:COUNTERPARTY_NAME_MAX_LEN]
+            file_stem = f"{counterparty_prefix}__{ksef_number}" if counterparty_prefix else ksef_number
         else:
             file_stem = ksef_number
 
@@ -1112,7 +1188,16 @@ def main() -> int:
         return 1
     console_ok(f"Authentication succeeded. Reference: {auth_result.reference_number}")
 
-    invoice_client = KsefClient(base_url=DEFAULT_BASE_URL, bearer_token=auth_result.access_token)
+    invoice_client = KsefClient(
+        base_url=DEFAULT_BASE_URL,
+        bearer_token=auth_result.access_token,
+        refresh_token=auth_result.refresh_token,
+        access_token_valid_until=auth_result.access_token_valid_until,
+    )
+    console_info(
+        f"Access token valid until: "
+        f"{auth_result.access_token_valid_until.isoformat(timespec='seconds')}"
+    )
 
     console_section("Rate Limits")
     invoice_client.rate_limiters = load_rate_limiters(invoice_client)
@@ -1134,6 +1219,7 @@ def main() -> int:
     download_targets = build_download_targets(
         metadata,
         filename_mode=args.filename_mode,
+        invoice_type=args.invoice_type,
     )
     tracked_ids = load_tracking_ids(tracking_file)
     already_tracked = sum(1 for invoice_id, _ in download_targets if invoice_id in tracked_ids)
