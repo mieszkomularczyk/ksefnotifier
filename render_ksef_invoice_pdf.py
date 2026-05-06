@@ -14,6 +14,7 @@ import hashlib
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime
@@ -42,6 +43,7 @@ class Party:
     name: str
     nip: str
     address_lines: list[str]
+    extra_rows: list[tuple[str, str]]
 
 
 @dataclass
@@ -57,6 +59,7 @@ class InvoiceItem:
     vat_amount: Decimal
     gross_amount: Decimal
     before_correction: str
+    extra_rows: list[tuple[str, str]]
 
 
 @dataclass
@@ -79,11 +82,17 @@ class InvoiceData:
     net_total: Decimal
     vat_total: Decimal
     gross_total: Decimal
+    summary_extra_rows: list[tuple[str, str]]
     qr_url: str
     all_fields: list[tuple[str, str]]
-    visualized_fields: set[str]
+    visualized_field_counts: dict[str, int]
     schema_note_rows: list[tuple[str, str]]
     correction_rows: list[tuple[str, str]]
+    transaction_rows: list[tuple[str, str]]
+    additional_party_rows: list[tuple[str, str]]
+    additional_description_rows: list[tuple[str, str, str]]
+    payment_rows: list[tuple[str, str]]
+    footer_rows: list[tuple[str, str]]
 
 
 def parse_args() -> argparse.Namespace:
@@ -197,6 +206,24 @@ def child_node(parent: Optional[ET.Element], ns_uri: str, tag_name: str) -> Opti
     return parent.find(tag_with_ns(ns_uri, tag_name))
 
 
+def child_nodes(parent: Optional[ET.Element], ns_uri: str, tag_name: str) -> list[ET.Element]:
+    if parent is None:
+        return []
+    return list(parent.findall(tag_with_ns(ns_uri, tag_name)))
+
+
+def append_row(rows: list[tuple[str, str]], label: str, value: str) -> None:
+    if value:
+        rows.append((label, value))
+
+
+def root_attribute(root: ET.Element, attribute_name: str) -> str:
+    for key, value in root.attrib.items():
+        if strip_namespace(key) == attribute_name:
+            return str(value)
+    return ""
+
+
 def sum_numbered_fields(parent: ET.Element, ns_uri: str, prefix: str, max_idx: int = 12) -> Decimal:
     total = Decimal("0")
     for idx in range(1, max_idx + 1):
@@ -212,12 +239,45 @@ def parse_party(root: ET.Element, ns_uri: str, node_name: str) -> Party:
     country = child_text(address, ns_uri, "KodKraju")
     line1 = child_text(address, ns_uri, "AdresL1")
     line2 = child_text(address, ns_uri, "AdresL2")
+    address_gln = child_text(address, ns_uri, "GLN")
     address_lines = [x for x in [line1, line2, country] if x]
+
+    extra_rows: list[tuple[str, str]] = []
+    append_row(extra_rows, "Prefiks podatnika", child_text(node, ns_uri, "PrefiksPodatnika"))
+    append_row(extra_rows, "Numer klienta", child_text(node, ns_uri, "NrKlienta"))
+    append_row(extra_rows, "ID nabywcy", child_text(node, ns_uri, "IDNabywcy"))
+    append_row(extra_rows, "Nr EORI", child_text(node, ns_uri, "NrEORI"))
+    append_row(extra_rows, "GLN adresu", address_gln)
+
+    no_tax_id = child_text(identity, ns_uri, "BrakID")
+    if no_tax_id:
+        append_row(extra_rows, "Brak identyfikatora podatkowego", flag_yes_no(no_tax_id))
+
+    eu_country = child_text(identity, ns_uri, "KodUE")
+    eu_vat = child_text(identity, ns_uri, "NrVatUE")
+    if eu_country or eu_vat:
+        append_row(extra_rows, "VAT UE", " ".join(part for part in [eu_country, eu_vat] if part))
+
+    correspondence = child_node(node, ns_uri, "AdresKoresp")
+    correspondence_lines = [
+        child_text(correspondence, ns_uri, "AdresL1"),
+        child_text(correspondence, ns_uri, "AdresL2"),
+        child_text(correspondence, ns_uri, "KodKraju"),
+    ]
+    correspondence_text = " | ".join(line for line in correspondence_lines if line)
+    append_row(extra_rows, "Adres korespondencyjny", correspondence_text)
+    append_row(extra_rows, "GLN adresu korespondencyjnego", child_text(correspondence, ns_uri, "GLN"))
+
+    for idx, contact in enumerate(child_nodes(node, ns_uri, "DaneKontaktowe"), start=1):
+        suffix = f" {idx}" if idx > 1 else ""
+        append_row(extra_rows, f"Email{suffix}", child_text(contact, ns_uri, "Email"))
+        append_row(extra_rows, f"Telefon{suffix}", child_text(contact, ns_uri, "Telefon"))
 
     return Party(
         name=child_text(identity, ns_uri, "Nazwa"),
         nip=child_text(identity, ns_uri, "NIP"),
         address_lines=address_lines,
+        extra_rows=extra_rows,
     )
 
 
@@ -288,6 +348,8 @@ def correction_invoice_type_label(invoice_type: str) -> str:
 
 def build_correction_rows(fa: ET.Element, ns_uri: str) -> list[tuple[str, str]]:
     rows: list[tuple[str, str]] = []
+    append_row(rows, "Przyczyna korekty", child_text(fa, ns_uri, "PrzyczynaKorekty"))
+
     for corrected in fa.findall(tag_with_ns(ns_uri, "DaneFaKorygowanej")):
         date = child_text(corrected, ns_uri, "DataWystFaKorygowanej")
         number = child_text(corrected, ns_uri, "NrFaKorygowanej")
@@ -309,17 +371,160 @@ def build_correction_rows(fa: ET.Element, ns_uri: str) -> list[tuple[str, str]]:
     return rows
 
 
+def build_summary_extra_rows(fa: ET.Element, ns_uri: str, currency: str) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    settlement = child_node(fa, ns_uri, "Rozliczenie")
+    amount_due_raw = child_text(settlement, ns_uri, "DoZaplaty")
+    amount_due = parse_optional_decimal(amount_due_raw)
+    if amount_due_raw:
+        rows.append(
+            (
+                "Do zaplaty",
+                format_amount(amount_due, currency) if amount_due is not None else amount_due_raw,
+            )
+        )
+
+    advances = child_nodes(fa, ns_uri, "ZaliczkaCzesciowa")
+    for idx, advance in enumerate(advances, start=1):
+        suffix = f" {idx}" if len(advances) > 1 else ""
+        append_row(rows, f"Data zaliczki czesciowej{suffix}", child_text(advance, ns_uri, "P_6Z"))
+        advance_amount_raw = child_text(advance, ns_uri, "P_15Z")
+        advance_amount = parse_optional_decimal(advance_amount_raw)
+        if advance_amount_raw:
+            rows.append(
+                (
+                    f"Kwota zaliczki czesciowej{suffix}",
+                    format_amount(advance_amount, currency)
+                    if advance_amount is not None
+                    else advance_amount_raw,
+                )
+            )
+    return rows
+
+
+def build_transaction_rows(fa: ET.Element, ns_uri: str) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    wz_documents = child_nodes(fa, ns_uri, "WZ")
+    for idx, wz in enumerate(wz_documents, start=1):
+        value = (wz.text or "").strip()
+        if value:
+            suffix = f" {idx}" if len(wz_documents) > 1 else ""
+            rows.append((f"Dokument WZ{suffix}", value))
+
+    orders: list[ET.Element] = []
+    for terms in child_nodes(fa, ns_uri, "WarunkiTransakcji"):
+        orders.extend(child_nodes(terms, ns_uri, "Zamowienia"))
+
+    for idx, order in enumerate(orders, start=1):
+        suffix = f" {idx}" if len(orders) > 1 else ""
+        append_row(rows, f"Numer zamowienia{suffix}", child_text(order, ns_uri, "NrZamowienia"))
+        append_row(rows, f"Data zamowienia{suffix}", child_text(order, ns_uri, "DataZamowienia"))
+    return rows
+
+
+def build_additional_description_rows(fa: ET.Element, ns_uri: str) -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
+    for description in child_nodes(fa, ns_uri, "DodatkowyOpis"):
+        line_no = child_text(description, ns_uri, "NrWiersza")
+        key = child_text(description, ns_uri, "Klucz")
+        value = child_text(description, ns_uri, "Wartosc")
+        if line_no or key or value:
+            rows.append((line_no, key, value))
+    return rows
+
+
+def build_additional_party_rows(root: ET.Element, ns_uri: str) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    parties = child_nodes(root, ns_uri, "Podmiot3")
+    for idx, party in enumerate(parties, start=1):
+        prefix = f"Podmiot dodatkowy {idx}" if len(parties) > 1 else "Podmiot dodatkowy"
+        identity = child_node(party, ns_uri, "DaneIdentyfikacyjne")
+        append_row(rows, f"{prefix} - rola", child_text(party, ns_uri, "Rola"))
+        append_row(rows, f"{prefix} - nazwa", child_text(identity, ns_uri, "Nazwa"))
+        append_row(rows, f"{prefix} - NIP", child_text(identity, ns_uri, "NIP"))
+        append_row(rows, f"{prefix} - VAT UE", " ".join(
+            part
+            for part in [
+                child_text(identity, ns_uri, "KodUE"),
+                child_text(identity, ns_uri, "NrVatUE"),
+            ]
+            if part
+        ))
+        no_tax_id = child_text(identity, ns_uri, "BrakID")
+        if no_tax_id:
+            append_row(rows, f"{prefix} - brak identyfikatora", flag_yes_no(no_tax_id))
+    return rows
+
+
+def build_payment_rows(payment: Optional[ET.Element], ns_uri: str, method_display: str) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    term = child_node(payment, ns_uri, "TerminPlatnosci")
+    term_description = child_node(term, ns_uri, "TerminOpis")
+    term_parts = [
+        child_text(term_description, ns_uri, "Ilosc"),
+        child_text(term_description, ns_uri, "Jednostka"),
+        child_text(term_description, ns_uri, "ZdarzeniePoczatkowe"),
+    ]
+    term_description_text = " ".join(part for part in term_parts if part)
+
+    append_row(rows, "Termin platnosci", child_text(term, ns_uri, "Termin"))
+    append_row(rows, "Opis terminu", term_description_text)
+
+    paid = child_text(payment, ns_uri, "Zaplacono")
+    if paid:
+        append_row(rows, "Zaplacono", flag_yes_no(paid))
+    append_row(rows, "Data zaplaty", child_text(payment, ns_uri, "DataZaplaty"))
+    append_row(rows, "Forma", method_display)
+
+    other_payment = child_text(payment, ns_uri, "PlatnoscInna")
+    if other_payment:
+        append_row(rows, "Platnosc inna", flag_yes_no(other_payment))
+    append_row(rows, "Opis platnosci", child_text(payment, ns_uri, "OpisPlatnosci"))
+
+    bank = child_node(payment, ns_uri, "RachunekBankowy")
+    append_row(rows, "Rachunek", child_text(bank, ns_uri, "NrRB"))
+    append_row(rows, "Opis rachunku", child_text(bank, ns_uri, "OpisRachunku"))
+    own_bank_account = child_text(bank, ns_uri, "RachunekWlasnyBanku")
+    if own_bank_account:
+        append_row(rows, "Rachunek wlasny banku", flag_yes_no(own_bank_account))
+    append_row(rows, "SWIFT", child_text(bank, ns_uri, "SWIFT"))
+    append_row(rows, "Bank", child_text(bank, ns_uri, "NazwaBanku"))
+    return rows
+
+
+def build_footer_rows(root: ET.Element, ns_uri: str) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    footer = child_node(root, ns_uri, "Stopka")
+    registers = child_node(footer, ns_uri, "Rejestry")
+    append_row(rows, "Pelna nazwa", child_text(registers, ns_uri, "PelnaNazwa"))
+    append_row(rows, "KRS", child_text(registers, ns_uri, "KRS"))
+    append_row(rows, "REGON", child_text(registers, ns_uri, "REGON"))
+    append_row(rows, "BDO", child_text(registers, ns_uri, "BDO"))
+
+    footnotes: list[ET.Element] = []
+    for information in child_nodes(footer, ns_uri, "Informacje"):
+        footnotes.extend(child_nodes(information, ns_uri, "StopkaFaktury"))
+    for idx, footnote in enumerate(footnotes, start=1):
+        value = (footnote.text or "").strip()
+        if value:
+            label = f"Informacja stopki {idx}" if len(footnotes) > 1 else "Informacja stopki"
+            rows.append((label, value))
+    return rows
+
+
 def build_schema_note_rows(root: ET.Element, fa: ET.Element, ns_uri: str) -> list[tuple[str, str]]:
     header = child_node(root, ns_uri, "Naglowek")
     form_code = child_node(header, ns_uri, "KodFormularza")
     form_code_text = (form_code.text or "").strip() if form_code is not None and form_code.text else ""
     system_code = form_code.attrib.get("kodSystemowy", "") if form_code is not None else ""
     schema_version = form_code.attrib.get("wersjaSchemy", "") if form_code is not None else ""
+    schema_location = root_attribute(root, "schemaLocation")
 
     rows: list[tuple[str, str]] = []
     if form_code_text or system_code or schema_version:
         value_parts = [part for part in [form_code_text, system_code, f"wersja schemy {schema_version}" if schema_version else ""] if part]
         rows.append(("Kod formularza", " / ".join(value_parts)))
+    append_row(rows, "Lokalizacja schemy", schema_location)
 
     for label, value in [
         ("Wariant formularza", child_text(header, ns_uri, "WariantFormularza")),
@@ -348,27 +553,73 @@ def build_schema_note_rows(root: ET.Element, fa: ET.Element, ns_uri: str) -> lis
             ("Odwrotne obciazenie", flag_yes_no(child_text(notes, ns_uri, "P_18"))),
             ("Mechanizm podzielonej platnosci", flag_yes_no(child_text(notes, ns_uri, "P_18A"))),
             ("Sprzedaz zwolniona", flag_no_yes(child_text(exemption, ns_uri, "P_19N"))),
+            ("Zwolnienie - podstawa P_19", child_text(exemption, ns_uri, "P_19")),
+            ("Zwolnienie - opis P_19A", child_text(exemption, ns_uri, "P_19A")),
+            ("Zwolnienie - opis P_19B", child_text(exemption, ns_uri, "P_19B")),
+            ("Zwolnienie - opis P_19C", child_text(exemption, ns_uri, "P_19C")),
             ("WDT nowych srodkow transportu", flag_no_yes(child_text(new_transport, ns_uri, "P_22N"))),
             ("Procedura uproszczona transakcji trojstronnej UE", flag_yes_no(child_text(notes, ns_uri, "P_23"))),
             ("Procedura marzy", flag_no_yes(child_text(margin, ns_uri, "P_PMarzyN"))),
         ]
     )
 
-    return [(label, value) for label, value in rows if value != "-"]
+    return [(label, value) for label, value in rows if value and value != "-"]
 
 
-def build_visualized_field_paths(all_fields: list[tuple[str, str]]) -> set[str]:
-    paths = {
+def count_field_paths(all_fields: list[tuple[str, str]]) -> Counter[str]:
+    return Counter(key for key, _ in all_fields)
+
+
+def mark_one(counts: dict[str, int], totals: Counter[str], path: str) -> None:
+    if totals[path]:
+        counts[path] = max(counts.get(path, 0), 1)
+
+
+def mark_all(counts: dict[str, int], totals: Counter[str], path: str) -> None:
+    if totals[path]:
+        counts[path] = totals[path]
+
+
+def build_visualized_field_counts(all_fields: list[tuple[str, str]]) -> dict[str, int]:
+    totals = count_field_paths(all_fields)
+    counts: dict[str, int] = {}
+
+    single_occurrence_paths = {
+        "Faktura@schemaLocation",
         invoice_path("Podmiot1", "DaneIdentyfikacyjne", "Nazwa"),
         invoice_path("Podmiot1", "DaneIdentyfikacyjne", "NIP"),
+        invoice_path("Podmiot1", "DaneIdentyfikacyjne", "BrakID"),
+        invoice_path("Podmiot1", "DaneIdentyfikacyjne", "KodUE"),
+        invoice_path("Podmiot1", "DaneIdentyfikacyjne", "NrVatUE"),
         invoice_path("Podmiot1", "Adres", "KodKraju"),
         invoice_path("Podmiot1", "Adres", "AdresL1"),
         invoice_path("Podmiot1", "Adres", "AdresL2"),
+        invoice_path("Podmiot1", "Adres", "GLN"),
+        invoice_path("Podmiot1", "PrefiksPodatnika"),
+        invoice_path("Podmiot1", "NrKlienta"),
+        invoice_path("Podmiot1", "NrEORI"),
+        invoice_path("Podmiot1", "IDNabywcy"),
+        invoice_path("Podmiot1", "AdresKoresp", "KodKraju"),
+        invoice_path("Podmiot1", "AdresKoresp", "AdresL1"),
+        invoice_path("Podmiot1", "AdresKoresp", "AdresL2"),
+        invoice_path("Podmiot1", "AdresKoresp", "GLN"),
         invoice_path("Podmiot2", "DaneIdentyfikacyjne", "Nazwa"),
         invoice_path("Podmiot2", "DaneIdentyfikacyjne", "NIP"),
+        invoice_path("Podmiot2", "DaneIdentyfikacyjne", "BrakID"),
+        invoice_path("Podmiot2", "DaneIdentyfikacyjne", "KodUE"),
+        invoice_path("Podmiot2", "DaneIdentyfikacyjne", "NrVatUE"),
         invoice_path("Podmiot2", "Adres", "KodKraju"),
         invoice_path("Podmiot2", "Adres", "AdresL1"),
         invoice_path("Podmiot2", "Adres", "AdresL2"),
+        invoice_path("Podmiot2", "Adres", "GLN"),
+        invoice_path("Podmiot2", "PrefiksPodatnika"),
+        invoice_path("Podmiot2", "NrKlienta"),
+        invoice_path("Podmiot2", "NrEORI"),
+        invoice_path("Podmiot2", "IDNabywcy"),
+        invoice_path("Podmiot2", "AdresKoresp", "KodKraju"),
+        invoice_path("Podmiot2", "AdresKoresp", "AdresL1"),
+        invoice_path("Podmiot2", "AdresKoresp", "AdresL2"),
+        invoice_path("Podmiot2", "AdresKoresp", "GLN"),
         invoice_path("Fa", "KodWaluty"),
         invoice_path("Fa", "P_1"),
         invoice_path("Fa", "P_1M"),
@@ -378,26 +629,22 @@ def build_visualized_field_paths(all_fields: list[tuple[str, str]]) -> set[str]:
         invoice_path("Fa", "OkresFa", "P_6_Do"),
         invoice_path("Fa", "RodzajFaktury"),
         invoice_path("Fa", "P_15"),
-        invoice_path("Fa", "FaWiersz", "NrWierszaFa"),
-        invoice_path("Fa", "FaWiersz", "P_7"),
-        invoice_path("Fa", "FaWiersz", "P_8A"),
-        invoice_path("Fa", "FaWiersz", "P_8B"),
-        invoice_path("Fa", "FaWiersz", "P_9A"),
-        invoice_path("Fa", "FaWiersz", "P_9B"),
-        invoice_path("Fa", "FaWiersz", "P_11"),
-        invoice_path("Fa", "FaWiersz", "P_11A"),
-        invoice_path("Fa", "FaWiersz", "P_11Vat"),
-        invoice_path("Fa", "FaWiersz", "P_12"),
-        invoice_path("Fa", "FaWiersz", "StanPrzed"),
         invoice_path("Fa", "Platnosc", "TerminPlatnosci", "Termin"),
+        invoice_path("Fa", "Platnosc", "TerminPlatnosci", "TerminOpis", "Ilosc"),
+        invoice_path("Fa", "Platnosc", "TerminPlatnosci", "TerminOpis", "Jednostka"),
+        invoice_path("Fa", "Platnosc", "TerminPlatnosci", "TerminOpis", "ZdarzeniePoczatkowe"),
         invoice_path("Fa", "Platnosc", "FormaPlatnosci"),
+        invoice_path("Fa", "Platnosc", "PlatnoscInna"),
+        invoice_path("Fa", "Platnosc", "OpisPlatnosci"),
+        invoice_path("Fa", "Platnosc", "Zaplacono"),
+        invoice_path("Fa", "Platnosc", "DataZaplaty"),
         invoice_path("Fa", "Platnosc", "RachunekBankowy", "NrRB"),
         invoice_path("Fa", "Platnosc", "RachunekBankowy", "NazwaBanku"),
-        invoice_path("Fa", "DaneFaKorygowanej", "DataWystFaKorygowanej"),
-        invoice_path("Fa", "DaneFaKorygowanej", "NrFaKorygowanej"),
-        invoice_path("Fa", "DaneFaKorygowanej", "NrKSeF"),
-        invoice_path("Fa", "DaneFaKorygowanej", "NrKSeFFaKorygowanej"),
-        invoice_path("Fa", "DaneFaKorygowanej", "NrKSeFN"),
+        invoice_path("Fa", "Platnosc", "RachunekBankowy", "OpisRachunku"),
+        invoice_path("Fa", "Platnosc", "RachunekBankowy", "RachunekWlasnyBanku"),
+        invoice_path("Fa", "Platnosc", "RachunekBankowy", "SWIFT"),
+        invoice_path("Fa", "PrzyczynaKorekty"),
+        invoice_path("Fa", "Rozliczenie", "DoZaplaty"),
         invoice_path("Naglowek", "KodFormularza@kodSystemowy"),
         invoice_path("Naglowek", "KodFormularza@wersjaSchemy"),
         invoice_path("Naglowek", "KodFormularza"),
@@ -411,15 +658,78 @@ def build_visualized_field_paths(all_fields: list[tuple[str, str]]) -> set[str]:
         invoice_path("Fa", "Adnotacje", "P_18"),
         invoice_path("Fa", "Adnotacje", "P_18A"),
         invoice_path("Fa", "Adnotacje", "Zwolnienie", "P_19N"),
+        invoice_path("Fa", "Adnotacje", "Zwolnienie", "P_19"),
+        invoice_path("Fa", "Adnotacje", "Zwolnienie", "P_19A"),
+        invoice_path("Fa", "Adnotacje", "Zwolnienie", "P_19B"),
+        invoice_path("Fa", "Adnotacje", "Zwolnienie", "P_19C"),
         invoice_path("Fa", "Adnotacje", "NoweSrodkiTransportu", "P_22N"),
         invoice_path("Fa", "Adnotacje", "P_23"),
         invoice_path("Fa", "Adnotacje", "PMarzy", "P_PMarzyN"),
+        invoice_path("Stopka", "Rejestry", "PelnaNazwa"),
+        invoice_path("Stopka", "Rejestry", "KRS"),
+        invoice_path("Stopka", "Rejestry", "REGON"),
+        invoice_path("Stopka", "Rejestry", "BDO"),
     }
+
+    all_occurrence_paths = {
+        invoice_path("Podmiot1", "DaneKontaktowe", "Email"),
+        invoice_path("Podmiot1", "DaneKontaktowe", "Telefon"),
+        invoice_path("Podmiot2", "DaneKontaktowe", "Email"),
+        invoice_path("Podmiot2", "DaneKontaktowe", "Telefon"),
+        invoice_path("Podmiot1", "DaneKontaktowe"),
+        invoice_path("Podmiot2", "DaneKontaktowe"),
+        invoice_path("Podmiot3", "Rola"),
+        invoice_path("Podmiot3", "DaneIdentyfikacyjne", "Nazwa"),
+        invoice_path("Podmiot3", "DaneIdentyfikacyjne", "NIP"),
+        invoice_path("Podmiot3", "DaneIdentyfikacyjne", "BrakID"),
+        invoice_path("Podmiot3", "DaneIdentyfikacyjne", "KodUE"),
+        invoice_path("Podmiot3", "DaneIdentyfikacyjne", "NrVatUE"),
+        invoice_path("Fa", "FaWiersz", "NrWierszaFa"),
+        invoice_path("Fa", "FaWiersz", "P_7"),
+        invoice_path("Fa", "FaWiersz", "P_6A"),
+        invoice_path("Fa", "FaWiersz", "P_8A"),
+        invoice_path("Fa", "FaWiersz", "P_8B"),
+        invoice_path("Fa", "FaWiersz", "P_9A"),
+        invoice_path("Fa", "FaWiersz", "P_9B"),
+        invoice_path("Fa", "FaWiersz", "P_10"),
+        invoice_path("Fa", "FaWiersz", "P_11"),
+        invoice_path("Fa", "FaWiersz", "P_11A"),
+        invoice_path("Fa", "FaWiersz", "P_11Vat"),
+        invoice_path("Fa", "FaWiersz", "P_12"),
+        invoice_path("Fa", "FaWiersz", "Indeks"),
+        invoice_path("Fa", "FaWiersz", "GTIN"),
+        invoice_path("Fa", "FaWiersz", "UU_ID"),
+        invoice_path("Fa", "FaWiersz", "KursWaluty"),
+        invoice_path("Fa", "FaWiersz", "KwotaAkcyzy"),
+        invoice_path("Fa", "FaWiersz", "StanPrzed"),
+        invoice_path("Fa", "DodatkowyOpis", "NrWiersza"),
+        invoice_path("Fa", "DodatkowyOpis", "Klucz"),
+        invoice_path("Fa", "DodatkowyOpis", "Wartosc"),
+        invoice_path("Fa", "DaneFaKorygowanej", "DataWystFaKorygowanej"),
+        invoice_path("Fa", "DaneFaKorygowanej", "NrFaKorygowanej"),
+        invoice_path("Fa", "DaneFaKorygowanej", "NrKSeF"),
+        invoice_path("Fa", "DaneFaKorygowanej", "NrKSeFFaKorygowanej"),
+        invoice_path("Fa", "DaneFaKorygowanej", "NrKSeFN"),
+        invoice_path("Fa", "WZ"),
+        invoice_path("Fa", "ZaliczkaCzesciowa", "P_6Z"),
+        invoice_path("Fa", "ZaliczkaCzesciowa", "P_15Z"),
+        invoice_path("Fa", "WarunkiTransakcji", "Zamowienia", "NrZamowienia"),
+        invoice_path("Fa", "WarunkiTransakcji", "Zamowienia", "DataZamowienia"),
+        invoice_path("Stopka", "Informacje", "StopkaFaktury"),
+        invoice_path("Stopka", "Informacje"),
+    }
+
+    for path in single_occurrence_paths:
+        mark_one(counts, totals, path)
+    for path in all_occurrence_paths:
+        mark_all(counts, totals, path)
+
     for key, _ in all_fields:
         leaf_name = key.rsplit("/", 1)[-1]
         if leaf_name.startswith("P_13_") or leaf_name.startswith("P_14_"):
-            paths.add(key)
-    return paths
+            mark_one(counts, totals, key)
+
+    return counts
 
 
 def parse_invoice(xml_path: Path) -> InvoiceData:
@@ -473,6 +783,18 @@ def parse_invoice(xml_path: Path) -> InvoiceData:
             unit_price = Decimal("0")
             unit_price_kind = ""
 
+        item_extra_rows: list[tuple[str, str]] = []
+        for label, tag_name in [
+            ("Data dostawy/uslugi pozycji", "P_6A"),
+            ("Indeks", "Indeks"),
+            ("GTIN", "GTIN"),
+            ("UU_ID", "UU_ID"),
+            ("Kwota opustu", "P_10"),
+            ("Kurs waluty", "KursWaluty"),
+            ("Kwota akcyzy", "KwotaAkcyzy"),
+        ]:
+            append_row(item_extra_rows, label, child_text(row, ns_uri, tag_name))
+
         items.append(
             InvoiceItem(
                 line_no=child_text(row, ns_uri, "NrWierszaFa"),
@@ -486,6 +808,7 @@ def parse_invoice(xml_path: Path) -> InvoiceData:
                 vat_amount=vat_amount,
                 gross_amount=gross_amount,
                 before_correction=before_correction_label(child_text(row, ns_uri, "StanPrzed")),
+                extra_rows=item_extra_rows,
             )
         )
 
@@ -508,6 +831,7 @@ def parse_invoice(xml_path: Path) -> InvoiceData:
         "Termin",
     )
     method_code = child_text(payment, ns_uri, "FormaPlatnosci")
+    method_display = PAYMENT_METHOD_BY_CODE.get(method_code, method_code)
     bank = payment.find(tag_with_ns(ns_uri, "RachunekBankowy")) if payment is not None else None
 
     period = fa.find(tag_with_ns(ns_uri, "OkresFa"))
@@ -519,12 +843,14 @@ def parse_invoice(xml_path: Path) -> InvoiceData:
         xml_bytes=xml_bytes,
     )
 
+    currency = child_text(fa, ns_uri, "KodWaluty", "PLN")
+
     return InvoiceData(
         invoice_number=child_text(fa, ns_uri, "P_2"),
         issue_date=child_text(fa, ns_uri, "P_1"),
         sale_date=child_text(fa, ns_uri, "P_6"),
         issue_place=child_text(fa, ns_uri, "P_1M"),
-        currency=child_text(fa, ns_uri, "KodWaluty", "PLN"),
+        currency=currency,
         invoice_type=child_text(fa, ns_uri, "RodzajFaktury", "VAT"),
         period_from=child_text(period, ns_uri, "P_6_Od"),
         period_to=child_text(period, ns_uri, "P_6_Do"),
@@ -532,17 +858,23 @@ def parse_invoice(xml_path: Path) -> InvoiceData:
         buyer=parse_party(root, ns_uri, "Podmiot2"),
         items=items,
         payment_due_date=due,
-        payment_method=PAYMENT_METHOD_BY_CODE.get(method_code, method_code),
+        payment_method=method_display,
         bank_account=child_text(bank, ns_uri, "NrRB"),
         bank_name=child_text(bank, ns_uri, "NazwaBanku"),
         net_total=net_total,
         vat_total=vat_total,
         gross_total=gross_total,
+        summary_extra_rows=build_summary_extra_rows(fa, ns_uri, currency),
         qr_url=qr_url,
         all_fields=all_fields,
-        visualized_fields=build_visualized_field_paths(all_fields),
+        visualized_field_counts=build_visualized_field_counts(all_fields),
         schema_note_rows=build_schema_note_rows(root, fa, ns_uri),
         correction_rows=build_correction_rows(fa, ns_uri),
+        transaction_rows=build_transaction_rows(fa, ns_uri),
+        additional_party_rows=build_additional_party_rows(root, ns_uri),
+        additional_description_rows=build_additional_description_rows(fa, ns_uri),
+        payment_rows=build_payment_rows(payment, ns_uri, method_display),
+        footer_rows=build_footer_rows(root, ns_uri),
     )
 
 
@@ -604,9 +936,87 @@ def configure_font(pdf: FPDF, regular_font: Optional[Path], bold_font: Optional[
 def encode_text(text: str, unicode_enabled: bool) -> str:
     # Strip control characters that cannot be represented in PDF text streams.
     cleaned = "".join(" " if (ord(ch) < 32 or 127 <= ord(ch) < 160) else ch for ch in text)
+    cleaned = cleaned.translate(
+        {
+            0x2010: ord("-"),
+            0x2011: ord("-"),
+            0x2012: ord("-"),
+            0x2013: ord("-"),
+            0x2014: ord("-"),
+            0x2212: ord("-"),
+        }
+    )
     if unicode_enabled:
         return cleaned
     return cleaned.encode("latin-1", errors="replace").decode("latin-1")
+
+
+def draw_key_value_section(
+    pdf: FPDF,
+    title: str,
+    rows: list[tuple[str, str]],
+    family: str,
+    unicode_enabled: bool,
+    *,
+    font_size: int = 9,
+    label_width: int = 55,
+) -> None:
+    if not rows:
+        return
+
+    pdf.set_fill_color(243, 245, 248)
+    pdf.set_font(family, "B", 11)
+    pdf.cell(0, 8, encode_text(title, unicode_enabled), new_x="LMARGIN", new_y="NEXT", fill=True)
+    pdf.set_font(family, "", font_size)
+    with pdf.table(
+        width=pdf.epw,
+        col_widths=(label_width, pdf.epw - label_width),
+        line_height=5,
+        first_row_as_headings=False,
+        text_align=("L", "L"),
+    ) as table:
+        for label, value in rows:
+            row = table.row()
+            row.cell(encode_text(label, unicode_enabled))
+            row.cell(encode_text(value, unicode_enabled))
+    pdf.ln(2)
+
+
+def draw_three_column_section(
+    pdf: FPDF,
+    title: str,
+    headers: tuple[str, str, str],
+    rows: list[tuple[str, str, str]],
+    family: str,
+    unicode_enabled: bool,
+    *,
+    col_widths: tuple[int, int, int],
+    font_size: int = 8,
+) -> None:
+    if not rows:
+        return
+
+    pdf.set_fill_color(243, 245, 248)
+    pdf.set_font(family, "B", 11)
+    pdf.cell(0, 8, encode_text(title, unicode_enabled), new_x="LMARGIN", new_y="NEXT", fill=True)
+    pdf.set_font(family, "", font_size)
+    with pdf.table(
+        width=pdf.epw,
+        col_widths=col_widths,
+        line_height=5,
+        first_row_as_headings=True,
+        text_align=("L", "L", "L"),
+        headings_style=FontFace(emphasis="B"),
+    ) as table:
+        header = table.row()
+        for label in headers:
+            header.cell(encode_text(label, unicode_enabled))
+        for first, second, third in rows:
+            row = table.row()
+            row.cell(encode_text(first or "-", unicode_enabled))
+            row.cell(encode_text(second or "-", unicode_enabled))
+            row.cell(encode_text(third or "-", unicode_enabled))
+    pdf.ln(2)
 
 
 def draw_party_block(pdf: FPDF, title: str, party: Party, family: str, unicode_enabled: bool) -> None:
@@ -618,6 +1028,10 @@ def draw_party_block(pdf: FPDF, title: str, party: Party, family: str, unicode_e
     pdf.cell(0, 6, encode_text(f"NIP: {party.nip or '-'}", unicode_enabled), new_x="LMARGIN", new_y="NEXT")
     for line in party.address_lines:
         pdf.cell(0, 6, encode_text(line, unicode_enabled), new_x="LMARGIN", new_y="NEXT")
+    if party.extra_rows:
+        pdf.set_font(family, "", 8)
+        for label, value in party.extra_rows:
+            pdf.multi_cell(0, 4.5, encode_text(f"{label}: {value}", unicode_enabled), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(1)
 
 
@@ -700,17 +1114,24 @@ def render_invoice_pdf(
     pdf.ln(2)
 
     if invoice.correction_rows:
-        pdf.set_fill_color(243, 245, 248)
-        pdf.set_font(family, "B", 11)
-        pdf.cell(0, 8, encode_text("Dane faktury korygowanej", unicode_enabled), new_x="LMARGIN", new_y="NEXT", fill=True)
-        pdf.set_font(family, "", 9)
-        for label, value in invoice.correction_rows:
-            pdf.cell(62, 6, encode_text(label, unicode_enabled), border=1)
-            pdf.cell(0, 6, encode_text(value, unicode_enabled), border=1, new_x="LMARGIN", new_y="NEXT")
-        pdf.ln(2)
+        draw_key_value_section(
+            pdf,
+            "Dane faktury korygowanej",
+            invoice.correction_rows,
+            family,
+            unicode_enabled,
+            label_width=62,
+        )
 
     draw_party_block(pdf, "Sprzedawca", invoice.seller, family, unicode_enabled)
     draw_party_block(pdf, "Nabywca", invoice.buyer, family, unicode_enabled)
+    draw_key_value_section(
+        pdf,
+        "Podmioty dodatkowe",
+        invoice.additional_party_rows,
+        family,
+        unicode_enabled,
+    )
 
     if invoice.schema_note_rows:
         pdf.set_fill_color(243, 245, 248)
@@ -738,6 +1159,14 @@ def render_invoice_pdf(
                     row.cell("")
                     row.cell("")
         pdf.ln(2)
+
+    draw_key_value_section(
+        pdf,
+        "Warunki transakcji",
+        invoice.transaction_rows,
+        family,
+        unicode_enabled,
+    )
 
     pdf.set_fill_color(243, 245, 248)
     pdf.set_font(family, "B", 11)
@@ -799,6 +1228,20 @@ def render_invoice_pdf(
                     row.cell(encode_text(item.before_correction, unicode_enabled))
 
     pdf.ln(2)
+    item_extra_rows: list[tuple[str, str, str]] = []
+    for item in invoice.items:
+        for label, value in item.extra_rows:
+            item_extra_rows.append((item.line_no, label, value))
+    draw_three_column_section(
+        pdf,
+        "Dodatkowe dane pozycji",
+        ("Wiersz", "Pole", "Wartosc"),
+        item_extra_rows,
+        family,
+        unicode_enabled,
+        col_widths=(18, 55, 112),
+    )
+
     pdf.set_fill_color(243, 245, 248)
     pdf.set_font(family, "B", 11)
     pdf.cell(0, 8, encode_text("Podsumowanie", unicode_enabled), new_x="LMARGIN", new_y="NEXT", fill=True)
@@ -810,20 +1253,40 @@ def render_invoice_pdf(
     pdf.set_font(family, "B", 10)
     pdf.cell(45, 7, encode_text("Razem brutto", unicode_enabled), border=1)
     pdf.cell(0, 7, encode_text(format_amount(invoice.gross_total, invoice.currency), unicode_enabled), border=1, new_x="LMARGIN", new_y="NEXT")
-
-    pdf.ln(2)
-    pdf.set_fill_color(243, 245, 248)
-    pdf.set_font(family, "B", 11)
-    pdf.cell(0, 8, encode_text("Platnosc", unicode_enabled), new_x="LMARGIN", new_y="NEXT", fill=True)
     pdf.set_font(family, "", 10)
-    for label, value in [
-        ("Termin platnosci", invoice.payment_due_date or "-"),
-        ("Forma", invoice.payment_method or "-"),
-        ("Rachunek", invoice.bank_account or "-"),
-        ("Bank", invoice.bank_name or "-"),
-    ]:
+    for label, value in invoice.summary_extra_rows:
         pdf.cell(45, 7, encode_text(label, unicode_enabled), border=1)
         pdf.cell(0, 7, encode_text(value, unicode_enabled), border=1, new_x="LMARGIN", new_y="NEXT")
+
+    pdf.ln(2)
+    draw_key_value_section(
+        pdf,
+        "Platnosc",
+        invoice.payment_rows,
+        family,
+        unicode_enabled,
+        font_size=10,
+        label_width=45,
+    )
+
+    draw_three_column_section(
+        pdf,
+        "Dodatkowe opisy z XML",
+        ("Wiersz", "Klucz", "Wartosc"),
+        invoice.additional_description_rows,
+        family,
+        unicode_enabled,
+        col_widths=(18, 55, 112),
+    )
+
+    draw_key_value_section(
+        pdf,
+        "Stopka i rejestry",
+        invoice.footer_rows,
+        family,
+        unicode_enabled,
+        label_width=45,
+    )
 
     if invoice.qr_url:
         if pdf.get_y() > 220:
@@ -860,7 +1323,10 @@ def render_invoice_pdf(
     pdf.cell(
         0,
         5,
-        encode_text("Czerwone pola nie maja reprezentacji na pierwszej stronie PDF.", unicode_enabled),
+        encode_text(
+            "Kolumna Wyst. pokazuje wystapienie n/N dla danej sciezki XML; czerwone wystapienia nie sa pokazane w glownej wizualizacji.",
+            unicode_enabled,
+        ),
         new_x="LMARGIN",
         new_y="NEXT",
     )
@@ -870,22 +1336,35 @@ def render_invoice_pdf(
     missing_field_style = FontFace(color=(190, 30, 30))
     with pdf.table(
         width=pdf.epw,
-        col_widths=(92, 93),
+        col_widths=(82, 18, 85),
         line_height=4,
         first_row_as_headings=True,
-        text_align=("L", "L"),
+        text_align=("L", "C", "L"),
         headings_style=FontFace(emphasis="B"),
     ) as table:
         header = table.row()
         header.cell(encode_text("Pole XML", unicode_enabled))
+        header.cell(encode_text("Wyst.", unicode_enabled))
         header.cell(encode_text("Wartosc", unicode_enabled))
+
+        path_totals = count_field_paths(invoice.all_fields)
+        path_seen: Counter[str] = Counter()
 
         for key, value in invoice.all_fields:
             if hide_empty_fields and not value:
                 continue
-            field_style = None if key in invoice.visualized_fields else missing_field_style
+            path_seen[key] += 1
+            occurrence_no = path_seen[key]
+            total_occurrences = path_totals[key]
+            occurrence_text = f"{occurrence_no}/{total_occurrences}"
+            field_style = (
+                None
+                if occurrence_no <= invoice.visualized_field_counts.get(key, 0)
+                else missing_field_style
+            )
             row = table.row()
             row.cell(encode_text(key, unicode_enabled), style=field_style)
+            row.cell(encode_text(occurrence_text, unicode_enabled), style=field_style)
             row.cell(encode_text(value if value else "", unicode_enabled), style=field_style)
 
     try:
