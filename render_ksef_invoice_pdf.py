@@ -491,11 +491,11 @@ def parse_invoice(xml_path: Path) -> InvoiceData:
 
     net_total = sum_numbered_fields(fa, ns_uri, "P_13")
     if net_total == Decimal("0"):
-        net_total = sum(i.net_amount for i in items)
+        net_total = sum((i.net_amount for i in items), Decimal("0"))
 
     vat_total = sum_numbered_fields(fa, ns_uri, "P_14")
     if vat_total == Decimal("0"):
-        vat_total = sum(i.vat_amount for i in items)
+        vat_total = sum((i.vat_amount for i in items), Decimal("0"))
 
     gross_total = parse_decimal(child_text(fa, ns_uri, "P_15"))
     if gross_total == Decimal("0"):
@@ -744,47 +744,59 @@ def render_invoice_pdf(
     pdf.cell(0, 8, encode_text("Pozycje faktury", unicode_enabled), new_x="LMARGIN", new_y="NEXT", fill=True)
     pdf.set_font(family, "", 8)
 
-    show_before_correction = any(item.before_correction for item in invoice.items)
-    item_col_widths = (
-        (6, 42, 7, 9, 16, 14, 9, 13, 15, 14)
-        if show_before_correction
-        else (6, 54, 8, 10, 17, 16, 10, 15, 16)
-    )
-    item_text_align = (
-        ("C", "L", "C", "R", "R", "R", "R", "R", "R", "C")
-        if show_before_correction
-        else ("C", "L", "C", "R", "R", "R", "R", "R", "R")
-    )
-    item_labels = ["Lp", "Opis", "JM", "Ilosc", unit_price_heading(invoice.items), "Netto", "VAT%", "VAT", "Brutto"]
-    if show_before_correction:
-        item_labels.append("Stan przed")
+    if not invoice.items:
+        pdf.set_font(family, "", 9)
+        pdf.multi_cell(
+            0,
+            6,
+            encode_text(
+                "Brak pozycji szczegolowych w XML. Faktury korygujace moga zawierac tylko dane korekty i podsumowanie.",
+                unicode_enabled,
+            ),
+            border=1,
+        )
+    else:
+        show_before_correction = any(item.before_correction for item in invoice.items)
+        item_col_widths = (
+            (6, 42, 7, 9, 16, 14, 9, 13, 15, 14)
+            if show_before_correction
+            else (6, 54, 8, 10, 17, 16, 10, 15, 16)
+        )
+        item_text_align = (
+            ("C", "L", "C", "R", "R", "R", "R", "R", "R", "C")
+            if show_before_correction
+            else ("C", "L", "C", "R", "R", "R", "R", "R", "R")
+        )
+        item_labels = ["Lp", "Opis", "JM", "Ilosc", unit_price_heading(invoice.items), "Netto", "VAT%", "VAT", "Brutto"]
+        if show_before_correction:
+            item_labels.append("Stan przed")
 
-    headings_style = FontFace(emphasis="B")
-    with pdf.table(
-        width=pdf.epw,
-        col_widths=item_col_widths,
-        line_height=5,
-        first_row_as_headings=True,
-        text_align=item_text_align,
-        headings_style=headings_style,
-    ) as table:
-        header = table.row()
-        for label in item_labels:
-            header.cell(encode_text(label, unicode_enabled))
+        headings_style = FontFace(emphasis="B")
+        with pdf.table(
+            width=pdf.epw,
+            col_widths=item_col_widths,
+            line_height=5,
+            first_row_as_headings=True,
+            text_align=item_text_align,
+            headings_style=headings_style,
+        ) as table:
+            header = table.row()
+            for label in item_labels:
+                header.cell(encode_text(label, unicode_enabled))
 
-        for item in invoice.items:
-            row = table.row()
-            row.cell(encode_text(item.line_no or "-", unicode_enabled))
-            row.cell(encode_text(item.description or "-", unicode_enabled))
-            row.cell(encode_text(item.unit or "-", unicode_enabled))
-            row.cell(encode_text(format_qty(item.quantity), unicode_enabled))
-            row.cell(encode_text(format_amount(item.unit_price, invoice.currency), unicode_enabled))
-            row.cell(encode_text(format_amount(item.net_amount, invoice.currency), unicode_enabled))
-            row.cell(encode_text(item.vat_rate or "-", unicode_enabled))
-            row.cell(encode_text(format_amount(item.vat_amount, invoice.currency), unicode_enabled))
-            row.cell(encode_text(format_amount(item.gross_amount, invoice.currency), unicode_enabled))
-            if show_before_correction:
-                row.cell(encode_text(item.before_correction, unicode_enabled))
+            for item in invoice.items:
+                row = table.row()
+                row.cell(encode_text(item.line_no or "-", unicode_enabled))
+                row.cell(encode_text(item.description or "-", unicode_enabled))
+                row.cell(encode_text(item.unit or "-", unicode_enabled))
+                row.cell(encode_text(format_qty(item.quantity), unicode_enabled))
+                row.cell(encode_text(format_amount(item.unit_price, invoice.currency), unicode_enabled))
+                row.cell(encode_text(format_amount(item.net_amount, invoice.currency), unicode_enabled))
+                row.cell(encode_text(item.vat_rate or "-", unicode_enabled))
+                row.cell(encode_text(format_amount(item.vat_amount, invoice.currency), unicode_enabled))
+                row.cell(encode_text(format_amount(item.gross_amount, invoice.currency), unicode_enabled))
+                if show_before_correction:
+                    row.cell(encode_text(item.before_correction, unicode_enabled))
 
     pdf.ln(2)
     pdf.set_fill_color(243, 245, 248)
