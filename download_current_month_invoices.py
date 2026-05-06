@@ -32,11 +32,11 @@ from zoneinfo import ZoneInfo
 
 DEFAULT_BASE_URL = "https://api.ksef.mf.gov.pl/v2"
 AUTH_CONTEXT_TYPE = "Nip"
-DEFAULT_SUBJECT_TYPE = "Subject2"
 DEFAULT_DATE_TYPE = "PermanentStorage"
 DEFAULT_PAGE_SIZE = 100
 DEFAULT_AUTH_POLL_INTERVAL = 1.0
 DEFAULT_AUTH_TIMEOUT_SECONDS = 120
+DEFAULT_INVOICE_TYPE = "purchase"
 DEFAULT_FILENAME_MODE = "seller-id"
 DEFAULT_RENDER_MODE = "yes"
 DEFAULT_TIMEZONE = "Europe/Warsaw"
@@ -45,6 +45,18 @@ DEFAULT_TOKEN_FILE = "token.txt"
 SELLER_NAME_MAX_LEN = 15
 TRACKING_FILE_NAME = "downloaded.txt"
 MASTER_PREFIX_FILE = "dir_prefix.txt"
+INVOICE_TYPE_CONFIG = {
+    "purchase": {
+        "subject_type": "Subject2",
+        "target_subdir": "ksef_purchase",
+        "label": "purchase invoices",
+    },
+    "sales": {
+        "subject_type": "Subject1",
+        "target_subdir": "ksef_sales",
+        "label": "sales invoices",
+    },
+}
 
 
 class KsefApiError(RuntimeError):
@@ -246,19 +258,18 @@ def console_list(title: str, items: Iterable[str], *, empty_message: str) -> Non
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Download purchase invoices from KSeF for the selected month and "
+            "Download purchase or sales invoices from KSeF for the selected month and "
             "optionally render each downloaded XML into PDF.\n\n"
             "Files next to this script or EXE:\n"
             "  token.txt      KSeF token used for authentication by default.\n"
             "  dir_prefix.txt Optional master path. If present and non-empty, invoices are "
-            "saved only to <dir_prefix>/<YYYY_MM>/ksef.\n\n"
+            "saved only to <dir_prefix>/<YYYY_MM>/ksef_purchase or ksef_sales.\n\n"
             "Target path behavior:\n"
             "  If dir_prefix.txt exists and contains a path, that location is used as the "
             "only download/render target.\n"
             "  If dir_prefix.txt is missing or empty, files are saved only to "
-            "./downloads/<YYYY-MM> next to this script or EXE.\n\n"
-            "The script authenticates using the NIP embedded in the token, downloads only "
-            "purchase invoices (Subject2), and stores downloaded invoice IDs in "
+            "./downloads/<YYYY-MM>/ksef_purchase or ksef_sales next to this script or EXE.\n\n"
+            "The script authenticates using the NIP embedded in the token and stores downloaded invoice IDs in "
             "downloaded.txt inside the active target folder."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -273,6 +284,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_DATE_TYPE,
         choices=["Issue", "Invoicing", "PermanentStorage"],
         help="Date dimension used in query filters.",
+    )
+    parser.add_argument(
+        "--invoice-type",
+        default=DEFAULT_INVOICE_TYPE,
+        choices=sorted(INVOICE_TYPE_CONFIG),
+        help="Invoice bucket to download: purchase -> Subject2, sales -> Subject1 (default: purchase).",
     )
     parser.add_argument(
         "--year",
@@ -651,6 +668,7 @@ def authenticate_by_ksef_token(
 def fetch_all_metadata(
     client: KsefClient,
     *,
+    subject_type: str,
     date_type: str,
     date_from: datetime,
     date_to: datetime,
@@ -663,7 +681,7 @@ def fetch_all_metadata(
 
     while True:
         filters = {
-            "subjectType": DEFAULT_SUBJECT_TYPE,
+            "subjectType": subject_type,
             "dateRange": {
                 "dateType": date_type,
                 "from": to_iso8601(date_from),
@@ -824,6 +842,10 @@ def render_downloaded_xmls(xml_files: Iterable[tuple[Path, str]]) -> tuple[List[
 def main() -> int:
     args = parse_args()
     app_dir = get_app_dir()
+    invoice_type_config = INVOICE_TYPE_CONFIG[args.invoice_type]
+    subject_type = invoice_type_config["subject_type"]
+    target_subdir = invoice_type_config["target_subdir"]
+    invoice_type_label = invoice_type_config["label"]
 
     token_file_path = resolve_app_relative_path(args.token_file)
     dir_prefix_file = app_dir / MASTER_PREFIX_FILE
@@ -849,12 +871,12 @@ def main() -> int:
 
     master_prefix = load_master_prefix()
     if master_prefix is not None:
-        output_dir = master_prefix / month_dir_master / "ksef"
+        output_dir = master_prefix / month_dir_master / target_subdir
         dir_prefix_message = (
             f"{MASTER_PREFIX_FILE} found: {dir_prefix_file.resolve()} -> {output_dir.resolve()}"
         )
     else:
-        output_dir = app_dir / DEFAULT_LOCAL_OUT_DIR / month_dir_local
+        output_dir = app_dir / DEFAULT_LOCAL_OUT_DIR / month_dir_local / target_subdir
         if dir_prefix_file.exists():
             dir_prefix_message = (
                 f"{MASTER_PREFIX_FILE} found but empty: {dir_prefix_file.resolve()}. "
@@ -880,8 +902,9 @@ def main() -> int:
     console_info(f"Target directory: {output_dir.resolve()}")
     console_info(f"Date range: {to_iso8601(start)} -> {to_iso8601(end)}")
     console_info(f"Date type: {args.date_type}")
+    console_info(f"Invoice type: {args.invoice_type} ({invoice_type_label})")
     console_info(f"Filename mode: {args.filename_mode}")
-    console_info(f"Subject type: {DEFAULT_SUBJECT_TYPE}")
+    console_info(f"Subject type: {subject_type}")
     console_info(f"Auth context: {AUTH_CONTEXT_TYPE}={context_value}")
     console_info(f"KSeF base URL: {DEFAULT_BASE_URL}")
 
@@ -913,6 +936,7 @@ def main() -> int:
     try:
         metadata = fetch_all_metadata(
             invoice_client,
+            subject_type=subject_type,
             date_type=args.date_type,
             date_from=start,
             date_to=end,

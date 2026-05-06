@@ -6,17 +6,19 @@ English documentation is first in this file. Polish documentation follows below.
 
 ### What this project does
 
-`ksefnotifier` downloads purchase invoices from KSeF for your company, keeps track of what has already been downloaded, and can also render each XML invoice into a readable PDF.
+`ksefnotifier` downloads purchase or sales invoices from KSeF for your company, keeps track of what has already been downloaded, and can also render each XML invoice into a readable PDF.
 
 Default behavior when you run the downloader without parameters:
 
 - it downloads invoices for the current month
 - it uses the KSeF storage date (`PermanentStorage`) as the date filter
-- it downloads purchase invoices only (`Subject2`)
+- it downloads purchase invoices by default (`Subject2`)
+- sales invoices can be downloaded with `--invoice-type sales` (`Subject1`)
 - it uses `seller-id` as the default filename mode
 - it renders PDFs by default
-- if `dir_prefix.txt` does not exist or is empty, files are saved to `downloads/<YYYY-MM>` next to the script or executable
-- if `dir_prefix.txt` exists and contains a path, files are saved only to `<dir_prefix>/<YYYY_MM>/ksef`
+- if `dir_prefix.txt` does not exist or is empty, files are saved to `downloads/<YYYY-MM>/ksef_purchase` next to the script or executable
+- if `dir_prefix.txt` exists and contains a path, purchase files are saved only to `<dir_prefix>/<YYYY_MM>/ksef_purchase`
+- sales files are saved to the matching `ksef_sales` folder
 
 This is not a "download everything every time" script.
 
@@ -34,7 +36,7 @@ Important limitations:
 - The downloader currently authenticates by `NIP` extracted from the KSeF token.
 - This means it is intended for companies and other entities that use KSeF in a `NIP` context.
 - It does not currently support authentication for individual users in a `PESEL`-style context.
-- It downloads purchase invoices only (`Subject2`), not invoices issued by your own company.
+- Purchase invoices use KSeF `Subject2`; sales invoices use KSeF `Subject1`.
 
 ### 1. Install Python
 
@@ -214,8 +216,10 @@ Example on macOS:
 
 Behavior:
 
-- If `dir_prefix.txt` exists and is not empty, files are saved only to `<dir_prefix>/<YYYY_MM>/ksef`
-- If `dir_prefix.txt` does not exist or is empty, files are saved only to `downloads/<YYYY-MM>` next to the script or executable
+- If `dir_prefix.txt` exists and is not empty, purchase files are saved only to `<dir_prefix>/<YYYY_MM>/ksef_purchase`
+- If `dir_prefix.txt` exists and is not empty, sales files are saved only to `<dir_prefix>/<YYYY_MM>/ksef_sales`
+- If `dir_prefix.txt` does not exist or is empty, purchase files are saved only to `downloads/<YYYY-MM>/ksef_purchase` next to the script or executable
+- If `dir_prefix.txt` does not exist or is empty, sales files are saved only to `downloads/<YYYY-MM>/ksef_sales` next to the script or executable
 
 The script also stores `downloaded.txt` in the active target folder, so already downloaded invoice IDs are not downloaded again.
 
@@ -241,6 +245,12 @@ Specific month:
 python download_current_month_invoices.py --year 2026 --month 3
 ```
 
+Sales invoices:
+
+```bash
+python download_current_month_invoices.py --invoice-type sales
+```
+
 Dry run only:
 
 ```bash
@@ -263,6 +273,7 @@ Notes:
 
 - If you run the program without parameters, it downloads the current month.
 - If you run the program without parameters, it uses `PermanentStorage` as the date type.
+- Default invoice type is `purchase`
 - Default filename mode is `seller-id`
 - Default render mode is `yes`
 - The script prints the token status, target directory, date range, and downloaded/rendered invoice list in the console
@@ -349,17 +360,19 @@ Place these files next to the executable if you want the default setup:
 
 ### Do czego sluzy ten projekt
 
-`ksefnotifier` pobiera z KSeF faktury zakupowe dla Twojej firmy, pilnuje ktore faktury zostaly juz pobrane, i moze tez automatycznie wygenerowac czytelny PDF z kazdego pliku XML.
+`ksefnotifier` pobiera z KSeF faktury zakupowe albo sprzedazowe dla Twojej firmy, pilnuje ktore faktury zostaly juz pobrane, i moze tez automatycznie wygenerowac czytelny PDF z kazdego pliku XML.
 
 Domyslne zachowanie po uruchomieniu downloadera bez parametrow:
 
 - pobierany jest biezacy miesiac
 - jako filtr daty uzywana jest data przechowywania w KSeF (`PermanentStorage`)
-- pobierane sa tylko faktury zakupowe (`Subject2`)
+- domyslnie pobierane sa faktury zakupowe (`Subject2`)
+- faktury sprzedazowe mozna pobrac przez `--invoice-type sales` (`Subject1`)
 - domyslny tryb nazewnictwa to `seller-id`
 - generowanie PDF jest domyslnie wlaczone
-- jesli `dir_prefix.txt` nie istnieje albo jest pusty, pliki trafiaja do `downloads/<YYYY-MM>` obok skryptu lub pliku wykonywalnego
-- jesli `dir_prefix.txt` istnieje i zawiera sciezke, pliki trafiaja tylko do `<dir_prefix>/<YYYY_MM>/ksef`
+- jesli `dir_prefix.txt` nie istnieje albo jest pusty, faktury zakupowe trafiaja do `downloads/<YYYY-MM>/ksef_purchase` obok skryptu lub pliku wykonywalnego
+- jesli `dir_prefix.txt` istnieje i zawiera sciezke, faktury zakupowe trafiaja tylko do `<dir_prefix>/<YYYY_MM>/ksef_purchase`
+- faktury sprzedazowe trafiaja do analogicznego katalogu `ksef_sales`
 
 To nie jest skrypt typu "za kazdym razem pobierz wszystko od nowa".
 
@@ -377,7 +390,7 @@ Wazne ograniczenia:
 - Downloader uwierzytelnia sie przez `NIP` wyciagniety z tokena KSeF.
 - Oznacza to, ze projekt jest przeznaczony glownie dla firm i innych podmiotow dzialajacych w kontekscie `NIP`.
 - Projekt nie obsluguje obecnie logowania dla osob fizycznych w kontekscie `PESEL`.
-- Pobierane sa tylko faktury zakupowe (`Subject2`), a nie faktury wystawione przez Twoja firme.
+- Faktury zakupowe uzywaja w KSeF `Subject2`; faktury sprzedazowe uzywaja `Subject1`.
 
 ### 1. Zainstaluj Python
 
@@ -557,8 +570,10 @@ Przyklad dla macOS:
 
 Dzialanie:
 
-- Jesli `dir_prefix.txt` istnieje i nie jest pusty, pliki sa zapisywane tylko do `<dir_prefix>/<YYYY_MM>/ksef`
-- Jesli `dir_prefix.txt` nie istnieje albo jest pusty, pliki sa zapisywane tylko do `downloads/<YYYY-MM>` obok skryptu lub pliku wykonywalnego
+- Jesli `dir_prefix.txt` istnieje i nie jest pusty, faktury zakupowe sa zapisywane tylko do `<dir_prefix>/<YYYY_MM>/ksef_purchase`
+- Jesli `dir_prefix.txt` istnieje i nie jest pusty, faktury sprzedazowe sa zapisywane tylko do `<dir_prefix>/<YYYY_MM>/ksef_sales`
+- Jesli `dir_prefix.txt` nie istnieje albo jest pusty, faktury zakupowe sa zapisywane tylko do `downloads/<YYYY-MM>/ksef_purchase` obok skryptu lub pliku wykonywalnego
+- Jesli `dir_prefix.txt` nie istnieje albo jest pusty, faktury sprzedazowe sa zapisywane tylko do `downloads/<YYYY-MM>/ksef_sales` obok skryptu lub pliku wykonywalnego
 
 Skrypt zapisuje tez `downloaded.txt` w aktywnym katalogu docelowym, aby nie pobierac ponownie tych samych identyfikatorow faktur.
 
@@ -584,6 +599,12 @@ Konkretny miesiac:
 python download_current_month_invoices.py --year 2026 --month 3
 ```
 
+Faktury sprzedazowe:
+
+```bash
+python download_current_month_invoices.py --invoice-type sales
+```
+
 Tylko podglad bez pobierania:
 
 ```bash
@@ -606,6 +627,7 @@ Uwagi:
 
 - Jesli uruchomisz program bez parametrow, pobierany jest biezacy miesiac.
 - Jesli uruchomisz program bez parametrow, jako typ daty uzywany jest `PermanentStorage`.
+- Domyslny typ faktur to `purchase`
 - Domyslny tryb nazewnictwa to `seller-id`
 - Domyslne renderowanie PDF jest wlaczone (`yes`)
 - Skrypt wypisuje w konsoli status tokena, katalog docelowy, zakres dat oraz liste pobranych i wyrenderowanych faktur
