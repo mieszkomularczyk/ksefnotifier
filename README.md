@@ -16,6 +16,8 @@ Default behavior when you run the downloader without parameters:
 - sales invoices can be downloaded with `--invoice-type sales` (`Subject1`)
 - it uses `seller-id` as the default filename mode
 - it renders PDFs by default
+- it reads active KSeF API limits from `/rate-limits` and slows down only when needed
+- if KSeF returns `429 Too Many Requests`, it waits according to the server retry hint and retries the request
 - if `dir_prefix.txt` does not exist or is empty, files are saved to `downloads/<YYYY-MM>/ksef_purchase` next to the script or executable
 - if `dir_prefix.txt` exists and contains a path, purchase files are saved only to `<dir_prefix>/<YYYY_MM>/ksef_purchase`
 - sales files are saved to the matching `ksef_sales` folder
@@ -370,6 +372,8 @@ Domyslne zachowanie po uruchomieniu downloadera bez parametrow:
 - faktury sprzedazowe mozna pobrac przez `--invoice-type sales` (`Subject1`)
 - domyslny tryb nazewnictwa to `seller-id`
 - generowanie PDF jest domyslnie wlaczone
+- skrypt odczytuje aktualne limity KSeF API z `/rate-limits` i zwalnia tylko wtedy, kiedy jest to potrzebne
+- jesli KSeF zwroci `429 Too Many Requests`, skrypt czeka zgodnie z podpowiedzia serwera i ponawia zadanie
 - jesli `dir_prefix.txt` nie istnieje albo jest pusty, faktury zakupowe trafiaja do `downloads/<YYYY-MM>/ksef_purchase` obok skryptu lub pliku wykonywalnego
 - jesli `dir_prefix.txt` istnieje i zawiera sciezke, faktury zakupowe trafiaja tylko do `<dir_prefix>/<YYYY_MM>/ksef_purchase`
 - faktury sprzedazowe trafiaja do analogicznego katalogu `ksef_sales`

@@ -22,6 +22,7 @@ import time
 from calendar import monthrange
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.error import HTTPError, URLError
@@ -45,6 +46,12 @@ DEFAULT_TOKEN_FILE = "token.txt"
 SELLER_NAME_MAX_LEN = 15
 TRACKING_FILE_NAME = "downloaded.txt"
 MASTER_PREFIX_FILE = "dir_prefix.txt"
+RATE_LIMIT_RETRY_BUFFER_SECONDS = 0.2
+DEFAULT_RATE_LIMIT_MAX_RETRIES = 8
+FALLBACK_RATE_LIMITS = {
+    "invoiceMetadata": {"perSecond": 8, "perMinute": 16, "perHour": 20},
+    "invoiceDownload": {"perSecond": 8, "perMinute": 16, "perHour": 64},
+}
 INVOICE_TYPE_CONFIG = {
     "purchase": {
         "subject_type": "Subject2",
@@ -62,6 +69,99 @@ INVOICE_TYPE_CONFIG = {
 class KsefApiError(RuntimeError):
     """Raised when KSeF API returns a non-success response."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: Optional[int] = None,
+        headers: Optional[Any] = None,
+        body: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.headers = headers
+        self.body = body
+
+
+@dataclass(frozen=True)
+class RateLimitValues:
+    per_second: int
+    per_minute: int
+    per_hour: int
+
+
+class SlidingWindowRateLimiter:
+    def __init__(self, group_name: str, limits: RateLimitValues) -> None:
+        self.group_name = group_name
+        self.windows = [
+            (1.0, limits.per_second),
+            (60.0, limits.per_minute),
+            (3600.0, limits.per_hour),
+        ]
+        self.timestamps: List[float] = []
+
+    def wait_for_slot(self) -> None:
+        while True:
+            now = time.monotonic()
+            max_window_seconds = max(window_seconds for window_seconds, _ in self.windows)
+            self.timestamps = [
+                stamp for stamp in self.timestamps if now - stamp < max_window_seconds
+            ]
+
+            wait_seconds = 0.0
+            for window_seconds, limit in self.windows:
+                if limit <= 0:
+                    continue
+                window_start = now - window_seconds
+                recent = [stamp for stamp in self.timestamps if stamp > window_start]
+                if len(recent) >= limit:
+                    wait_seconds = max(
+                        wait_seconds,
+                        window_seconds - (now - min(recent)) + RATE_LIMIT_RETRY_BUFFER_SECONDS,
+                    )
+
+            if wait_seconds <= 0:
+                return
+
+            console_info(
+                f"Rate limit {self.group_name}: waiting {wait_seconds:.1f}s before next request"
+            )
+            time.sleep(wait_seconds)
+
+    def record_request(self) -> None:
+        self.timestamps.append(time.monotonic())
+
+
+def parse_retry_after_seconds(headers: Optional[Any], body: Optional[str]) -> Optional[float]:
+    retry_after_raw = None
+    if headers is not None:
+        try:
+            retry_after_raw = headers.get("Retry-After")
+        except AttributeError:
+            retry_after_raw = None
+
+    if retry_after_raw:
+        text = str(retry_after_raw).strip()
+        try:
+            return max(0.0, float(text.replace(",", ".")))
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(text)
+                return max(0.0, (retry_at - datetime.now(retry_at.tzinfo)).total_seconds())
+            except Exception:
+                pass
+
+    if body:
+        match = re.search(
+            r"po\s+(\d+(?:[\.,]\d+)?)\s+sek",
+            body,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            return max(0.0, float(match.group(1).replace(",", ".")))
+
+    return None
+
 
 @dataclass
 class AuthResult:
@@ -75,6 +175,8 @@ class KsefClient:
     base_url: str
     bearer_token: Optional[str] = None
     timeout_seconds: int = 60
+    rate_limiters: Optional[Dict[str, SlidingWindowRateLimiter]] = None
+    max_rate_limit_retries: int = DEFAULT_RATE_LIMIT_MAX_RETRIES
 
     def _request(
         self,
@@ -85,6 +187,7 @@ class KsefClient:
         json_body: Optional[Dict[str, Any]] = None,
         accept: str = "application/json",
         bearer_token: Optional[str] = None,
+        rate_group: Optional[str] = None,
     ) -> bytes:
         base = self.base_url.rstrip("/")
         url = f"{base}/{path.lstrip('/')}"
@@ -106,16 +209,39 @@ class KsefClient:
 
         request = Request(url=url, method=method.upper(), data=data, headers=headers)
 
-        try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
-                return response.read()
-        except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise KsefApiError(
-                f"KSeF API error {exc.code} for {method.upper()} {url}: {body}"
-            ) from exc
-        except URLError as exc:
-            raise KsefApiError(f"Network error for {method.upper()} {url}: {exc}") from exc
+        limiter = self.rate_limiters.get(rate_group) if self.rate_limiters and rate_group else None
+
+        attempts = 0
+        while True:
+            if limiter is not None:
+                limiter.wait_for_slot()
+                limiter.record_request()
+
+            try:
+                with urlopen(request, timeout=self.timeout_seconds) as response:
+                    return response.read()
+            except HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                if exc.code == 429 and attempts < self.max_rate_limit_retries:
+                    attempts += 1
+                    retry_after = parse_retry_after_seconds(exc.headers, body)
+                    if retry_after is None:
+                        retry_after = 1.0
+                    retry_after += RATE_LIMIT_RETRY_BUFFER_SECONDS
+                    console_warn(
+                        f"KSeF rate limit hit for {rate_group or 'request'}; "
+                        f"retrying in {retry_after:.1f}s (attempt {attempts}/{self.max_rate_limit_retries})"
+                    )
+                    time.sleep(retry_after)
+                    continue
+                raise KsefApiError(
+                    f"KSeF API error {exc.code} for {method.upper()} {url}: {body}",
+                    status_code=exc.code,
+                    headers=exc.headers,
+                    body=body,
+                ) from exc
+            except URLError as exc:
+                raise KsefApiError(f"Network error for {method.upper()} {url}: {exc}") from exc
 
     def post_json(
         self,
@@ -124,6 +250,7 @@ class KsefClient:
         query: Optional[Dict[str, Any]] = None,
         json_body: Optional[Dict[str, Any]] = None,
         bearer_token: Optional[str] = None,
+        rate_group: Optional[str] = None,
     ) -> Dict[str, Any]:
         payload = self._request(
             "POST",
@@ -132,6 +259,7 @@ class KsefClient:
             json_body=json_body,
             accept="application/json",
             bearer_token=bearer_token,
+            rate_group=rate_group,
         )
         try:
             return json.loads(payload.decode("utf-8"))
@@ -146,6 +274,7 @@ class KsefClient:
         *,
         query: Optional[Dict[str, Any]] = None,
         bearer_token: Optional[str] = None,
+        rate_group: Optional[str] = None,
     ) -> Any:
         payload = self._request(
             "GET",
@@ -153,6 +282,7 @@ class KsefClient:
             query=query,
             accept="application/json",
             bearer_token=bearer_token,
+            rate_group=rate_group,
         )
         try:
             return json.loads(payload.decode("utf-8"))
@@ -161,12 +291,19 @@ class KsefClient:
                 f"Invalid JSON in response for GET {path}: {payload[:500]!r}"
             ) from exc
 
-    def get_xml(self, path: str, *, bearer_token: Optional[str] = None) -> str:
+    def get_xml(
+        self,
+        path: str,
+        *,
+        bearer_token: Optional[str] = None,
+        rate_group: Optional[str] = None,
+    ) -> str:
         payload = self._request(
             "GET",
             path,
             accept="application/xml",
             bearer_token=bearer_token,
+            rate_group=rate_group,
         )
         return payload.decode("utf-8", errors="replace")
 
@@ -368,6 +505,50 @@ def load_master_prefix() -> Optional[Path]:
     if not path.is_absolute():
         path = (get_app_dir() / path).resolve()
     return path
+
+
+def rate_limit_values_from_payload(
+    payload: Any,
+    group_name: str,
+    fallback: Dict[str, int],
+) -> RateLimitValues:
+    group_payload = payload.get(group_name) if isinstance(payload, dict) else None
+    if not isinstance(group_payload, dict):
+        console_warn(f"Rate limits: missing {group_name}; using documented fallback")
+        group_payload = fallback
+
+    try:
+        return RateLimitValues(
+            per_second=int(group_payload["perSecond"]),
+            per_minute=int(group_payload["perMinute"]),
+            per_hour=int(group_payload["perHour"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        console_warn(f"Rate limits: invalid {group_name}; using documented fallback")
+        return RateLimitValues(
+            per_second=int(fallback["perSecond"]),
+            per_minute=int(fallback["perMinute"]),
+            per_hour=int(fallback["perHour"]),
+        )
+
+
+def load_rate_limiters(client: KsefClient) -> Dict[str, SlidingWindowRateLimiter]:
+    try:
+        payload = client.get_json("/rate-limits")
+        console_ok("Loaded active KSeF API rate limits")
+    except KsefApiError as exc:
+        console_warn(f"Could not load KSeF API rate limits: {exc}. Using documented fallbacks.")
+        payload = {}
+
+    limiters: Dict[str, SlidingWindowRateLimiter] = {}
+    for group_name, fallback in FALLBACK_RATE_LIMITS.items():
+        limits = rate_limit_values_from_payload(payload, group_name, fallback)
+        limiters[group_name] = SlidingWindowRateLimiter(group_name, limits)
+        console_info(
+            f"Rate limit {group_name}: {limits.per_second}/s, "
+            f"{limits.per_minute}/min, {limits.per_hour}/h"
+        )
+    return limiters
 
 
 def load_tracking_ids(track_file: Path) -> set[str]:
@@ -697,6 +878,7 @@ def fetch_all_metadata(
                 "pageSize": DEFAULT_PAGE_SIZE,
             },
             json_body=filters,
+            rate_group="invoiceMetadata",
         )
 
         invoices = response.get("invoices", [])
@@ -793,7 +975,7 @@ def download_invoices(
             skipped_existing += 1
 
         encoded = quote(ksef_number, safe="")
-        xml_text = client.get_xml(f"/invoices/ksef/{encoded}")
+        xml_text = client.get_xml(f"/invoices/ksef/{encoded}", rate_group="invoiceDownload")
         for target in targets_for_id:
             if target.exists() and not overwrite:
                 continue
@@ -931,6 +1113,9 @@ def main() -> int:
     console_ok(f"Authentication succeeded. Reference: {auth_result.reference_number}")
 
     invoice_client = KsefClient(base_url=DEFAULT_BASE_URL, bearer_token=auth_result.access_token)
+
+    console_section("Rate Limits")
+    invoice_client.rate_limiters = load_rate_limiters(invoice_client)
 
     console_section("Query")
     try:
