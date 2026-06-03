@@ -224,11 +224,17 @@ def root_attribute(root: ET.Element, attribute_name: str) -> str:
     return ""
 
 
-def sum_numbered_fields(parent: ET.Element, ns_uri: str, prefix: str, max_idx: int = 12) -> Decimal:
+def sum_numbered_fields_with_presence(
+    parent: ET.Element, ns_uri: str, prefix: str, max_idx: int = 12
+) -> tuple[Decimal, bool]:
     total = Decimal("0")
+    any_present = False
     for idx in range(1, max_idx + 1):
-        total += parse_decimal(child_text(parent, ns_uri, f"{prefix}_{idx}"))
-    return total
+        raw_value = child_text(parent, ns_uri, f"{prefix}_{idx}")
+        if raw_value:
+            any_present = True
+            total += parse_decimal(raw_value)
+    return total, any_present
 
 
 def parse_party(root: ET.Element, ns_uri: str, node_name: str) -> Party:
@@ -746,6 +752,7 @@ def parse_invoice(xml_path: Path) -> InvoiceData:
     if fa is None:
         raise ValueError(f"Missing <Fa> node in {xml_path}")
 
+    invoice_type = child_text(fa, ns_uri, "RodzajFaktury", "VAT")
     items: list[InvoiceItem] = []
     for row in fa.findall(tag_with_ns(ns_uri, "FaWiersz")):
         vat_rate = child_text(row, ns_uri, "P_12")
@@ -812,16 +819,27 @@ def parse_invoice(xml_path: Path) -> InvoiceData:
             )
         )
 
-    net_total = sum_numbered_fields(fa, ns_uri, "P_13")
-    if net_total == Decimal("0"):
-        net_total = sum((i.net_amount for i in items), Decimal("0"))
+    summary_items = [item for item in items if not item.before_correction]
+    if not summary_items:
+        summary_items = items
 
-    vat_total = sum_numbered_fields(fa, ns_uri, "P_14")
-    if vat_total == Decimal("0"):
-        vat_total = sum((i.vat_amount for i in items), Decimal("0"))
+    gross_total_xml = parse_optional_decimal(child_text(fa, ns_uri, "P_15"))
+    net_total, has_net_total = sum_numbered_fields_with_presence(fa, ns_uri, "P_13")
+    if not has_net_total:
+        if invoice_type.startswith("KOR") and gross_total_xml is not None:
+            net_total = Decimal("0")
+        else:
+            net_total = sum((i.net_amount for i in summary_items), Decimal("0"))
 
-    gross_total = parse_decimal(child_text(fa, ns_uri, "P_15"))
-    if gross_total == Decimal("0"):
+    vat_total, has_vat_total = sum_numbered_fields_with_presence(fa, ns_uri, "P_14")
+    if not has_vat_total:
+        if invoice_type.startswith("KOR") and gross_total_xml is not None:
+            vat_total = Decimal("0")
+        else:
+            vat_total = sum((i.vat_amount for i in summary_items), Decimal("0"))
+
+    gross_total = gross_total_xml if gross_total_xml is not None else Decimal("0")
+    if gross_total_xml is None:
         gross_total = net_total + vat_total
 
     payment = fa.find(tag_with_ns(ns_uri, "Platnosc"))
@@ -851,7 +869,7 @@ def parse_invoice(xml_path: Path) -> InvoiceData:
         sale_date=child_text(fa, ns_uri, "P_6"),
         issue_place=child_text(fa, ns_uri, "P_1M"),
         currency=currency,
-        invoice_type=child_text(fa, ns_uri, "RodzajFaktury", "VAT"),
+        invoice_type=invoice_type,
         period_from=child_text(period, ns_uri, "P_6_Od"),
         period_to=child_text(period, ns_uri, "P_6_Do"),
         seller=seller,
@@ -898,6 +916,15 @@ def unit_price_heading(items: list[InvoiceItem]) -> str:
     if kinds == {"net"}:
         return "Cena netto"
     return "Cena jedn."
+
+
+def should_render_summary(invoice: InvoiceData) -> bool:
+    if invoice.invoice_type.startswith("KOR") and not invoice.summary_extra_rows:
+        return any(
+            amount != Decimal("0")
+            for amount in (invoice.net_total, invoice.vat_total, invoice.gross_total)
+        )
+    return True
 
 
 def discover_system_font_pair() -> Optional[tuple[Path, Path]]:
@@ -1242,23 +1269,24 @@ def render_invoice_pdf(
         col_widths=(18, 55, 112),
     )
 
-    pdf.set_fill_color(243, 245, 248)
-    pdf.set_font(family, "B", 11)
-    pdf.cell(0, 8, encode_text("Podsumowanie", unicode_enabled), new_x="LMARGIN", new_y="NEXT", fill=True)
-    pdf.set_font(family, "", 10)
-    pdf.cell(45, 7, encode_text("Razem netto", unicode_enabled), border=1)
-    pdf.cell(0, 7, encode_text(format_amount(invoice.net_total, invoice.currency), unicode_enabled), border=1, new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(45, 7, encode_text("Razem VAT", unicode_enabled), border=1)
-    pdf.cell(0, 7, encode_text(format_amount(invoice.vat_total, invoice.currency), unicode_enabled), border=1, new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font(family, "B", 10)
-    pdf.cell(45, 7, encode_text("Razem brutto", unicode_enabled), border=1)
-    pdf.cell(0, 7, encode_text(format_amount(invoice.gross_total, invoice.currency), unicode_enabled), border=1, new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font(family, "", 10)
-    for label, value in invoice.summary_extra_rows:
-        pdf.cell(45, 7, encode_text(label, unicode_enabled), border=1)
-        pdf.cell(0, 7, encode_text(value, unicode_enabled), border=1, new_x="LMARGIN", new_y="NEXT")
+    if should_render_summary(invoice):
+        pdf.set_fill_color(243, 245, 248)
+        pdf.set_font(family, "B", 11)
+        pdf.cell(0, 8, encode_text("Podsumowanie", unicode_enabled), new_x="LMARGIN", new_y="NEXT", fill=True)
+        pdf.set_font(family, "", 10)
+        pdf.cell(45, 7, encode_text("Razem netto", unicode_enabled), border=1)
+        pdf.cell(0, 7, encode_text(format_amount(invoice.net_total, invoice.currency), unicode_enabled), border=1, new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(45, 7, encode_text("Razem VAT", unicode_enabled), border=1)
+        pdf.cell(0, 7, encode_text(format_amount(invoice.vat_total, invoice.currency), unicode_enabled), border=1, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font(family, "B", 10)
+        pdf.cell(45, 7, encode_text("Razem brutto", unicode_enabled), border=1)
+        pdf.cell(0, 7, encode_text(format_amount(invoice.gross_total, invoice.currency), unicode_enabled), border=1, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font(family, "", 10)
+        for label, value in invoice.summary_extra_rows:
+            pdf.cell(45, 7, encode_text(label, unicode_enabled), border=1)
+            pdf.cell(0, 7, encode_text(value, unicode_enabled), border=1, new_x="LMARGIN", new_y="NEXT")
 
-    pdf.ln(2)
+        pdf.ln(2)
     draw_key_value_section(
         pdf,
         "Platnosc",
